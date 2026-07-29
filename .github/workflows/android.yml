@@ -21,11 +21,17 @@ jobs:
           unzip -q android-ndk-r26d-linux.zip
           echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
 
-      - name: Install Nim
+      - name: Install Nim (pinned to 2.0.14)
         run: |
           curl -sL https://nim-lang.org/choosenim/init.sh -o init.sh
           sh init.sh -y
           echo "$HOME/.nimble/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.nimble/bin:$PATH"
+          choosenim 2.0.14
+
+      - name: Show Nim version
+        run: |
+          nim --version
 
       - name: Install dependencies and fetch network
         run: |
