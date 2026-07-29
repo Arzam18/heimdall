@@ -36,6 +36,10 @@ jobs:
           git -C networks lfs checkout "files/gramr.bin"
           nimble install -d -y
 
+      - name: Sanity check - plain native build (no custom flags)
+        run: |
+          nim c --path:src -d:danger -d:evalFile=../networks/files/gramr.bin -d:netID=gramr -o:bin/heimdall-native src/heimdall.nim
+
       - name: Build for Android ARM64 (no SIMD, scalar fallback)
         run: |
           nim c \
