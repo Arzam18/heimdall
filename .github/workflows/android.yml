@@ -1,0 +1,98 @@
+name: Heimdall
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Android NDK
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
+          unzip -q android-ndk-r26d-linux.zip
+          echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
+
+      - name: Install Nim
+        run: |
+          curl -sL https://nim-lang.org/choosenim/init.sh -o init.sh
+          sh init.sh -y
+          echo "$HOME/.nimble/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies and fetch network
+        run: |
+          export GIT_LFS_SKIP_SMUDGE=1
+          git submodule update --init --recursive
+          git -C networks lfs install --local
+          git -C networks lfs fetch --include="files/gramr.bin"
+          git -C networks lfs checkout "files/gramr.bin"
+          nimble install -d -y
+
+      - name: Build for Android ARM64 (no SIMD, scalar fallback)
+        run: |
+          nim c \
+            --path:src \
+            --panics:on \
+            --mm:atomicArc \
+            -d:useMalloc \
+            -o:bin/heimdall \
+            -u:simd -u:avx2 \
+            -d:outputBuckets=8 \
+            -d:inputBuckets=16 \
+            -d:ftSize=768 \
+            -d:l1Size=1536 \
+            -d:l2Size=16 \
+            -d:l3Size=32 \
+            -d:evalScale=322 \
+            -d:ftQuantBits=8 \
+            -d:l1QuantBits=7 \
+            -d:quantBits=6 \
+            -d:ftScaleBits=7 \
+            -d:evalNormalizeFactor=292 \
+            -d:majorVersion=1 \
+            -d:minorVersion=5 \
+            -d:patchVersion=0 \
+            -d:evalFile=../networks/files/gramr.bin \
+            -d:netID=gramr \
+            -d:thpPageAlignment:2097152 \
+            -d:mergedKings=false \
+            -d:dualActivation \
+            -d:verbatimNet=false \
+            -d:pairwiseNet=false \
+            -d:horizontalMirroring=true \
+            -d:danger \
+            --deepcopy:on \
+            --cc:clang \
+            --clang.exe:$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang \
+            --clang.linkerexe:$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang \
+            --passC:"-march=armv8-a" \
+            --passL:"-flto -static-libstdc++" \
+            src/heimdall.nim
+
+      - name: List build output
+        run: |
+          find bin -maxdepth 1 -type f -executable
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: heimdall-android-arm64
+          path: bin/heimdall
+
+      - name: Create prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-build-${{ github.run_number }}
+          name: Heimdall Build ${{ github.run_number }}
+          prerelease: true
+          files: bin/heimdall
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
