@@ -42,6 +42,12 @@ jobs:
           git -C networks lfs checkout "files/gramr.bin"
           nimble install -d -y
 
+      - name: Patch ambiguous File identifier
+        run: |
+          sed -n '35,50p' src/heimdall/util/magics.nim
+          sed -i '42s/\bFile\b/pieces.File/' src/heimdall/util/magics.nim
+          sed -n '35,50p' src/heimdall/util/magics.nim
+
       - name: Sanity check - plain native build (no custom flags)
         run: |
           nim c --path:src -d:danger -d:evalFile=../networks/files/gramr.bin -d:netID=gramr -o:bin/heimdall-native src/heimdall.nim
