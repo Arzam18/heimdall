@@ -42,12 +42,12 @@ jobs:
           git -C networks lfs checkout "files/gramr.bin"
           nimble install -d -y
 
-      - name: Patch ambiguous File identifier (all occurrences)
+      - name: Show imports and ambiguous lines
         run: |
+          echo "----- imports (first 20 lines) -----"
+          head -20 src/heimdall/util/magics.nim
+          echo "----- all File occurrences -----"
           grep -n "\bFile\b" src/heimdall/util/magics.nim
-          sed -i 's/\bFile\b/pieces.File/g' src/heimdall/util/magics.nim
-          echo "----- after patch -----"
-          grep -n "pieces\.File" src/heimdall/util/magics.nim
 
       - name: Sanity check - plain native build (no custom flags)
         run: |
