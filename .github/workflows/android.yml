@@ -37,6 +37,7 @@ jobs:
             LD="$NDK_LD" \
             HOST_ARCH=arm64 \
             NATIVE_ARCH_FLAGS="" \
+            CFLAGS="-flto" \
             OS_TAG=android \
             EXE_BASE=bin/heimdall-android-arm64 \
             EXTRA_NFLAGS="--cpu:arm64 --os:android --clang.exe='$NDK_CLANG' --clang.linkerexe='$NDK_CLANG'"
