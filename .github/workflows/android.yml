@@ -33,9 +33,10 @@ jobs:
           NDK_LD=$NDK_BIN/ld.lld
 
           make neon \
-            CC="$NDK_CLANG" \
+            CC=clang \
             LD="$NDK_LD" \
             HOST_ARCH=arm64 \
+            NATIVE_ARCH_FLAGS="" \
             OS_TAG=android \
             EXE_BASE=bin/heimdall-android-arm64 \
             EXTRA_NFLAGS="--cpu:arm64 --os:android --clang.exe='$NDK_CLANG' --clang.linkerexe='$NDK_CLANG'"
