@@ -22,18 +22,13 @@ jobs:
         with:
           nim-version: 'stable'
 
-      - name: Setup Android NDK
-        uses: nshipman-io/setup-android-ndk@v1
-        with:
-          ndk-version: r26b
-
       - name: Install Nimble Dependencies
         run: |
           nimble install -y -d
 
       - name: Build Heimdall (Android ARM64 / NEON)
         run: |
-          NDK_BIN=$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin
+          NDK_BIN=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
           NDK_CLANG=$NDK_BIN/aarch64-linux-android28-clang
           NDK_LD=$NDK_BIN/ld.lld
 
