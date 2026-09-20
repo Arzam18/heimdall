@@ -38,8 +38,8 @@ type
 # Yeah uh, don't look too closely at this...
 proc generateRookBlockers: array[Square.smallest()..Square.biggest(), Bitboard] {.compileTime.} =
     ## Generates all blocker masks for rooks
-    for rank in Rank.all():
-        for file in File.all():
+    for rank in Rank.items():
+        for file in File.items():
             let
                 square = makeSquare(rank, file)
                 bitboard = square.toBitboard()
@@ -78,8 +78,8 @@ proc generateRookBlockers: array[Square.smallest()..Square.biggest(), Bitboard] 
 # Or, well, the trick at the end isn't mine
 func generateBishopBlockers: array[Square.smallest()..Square.biggest(), Bitboard] {.compileTime.} =
     ## Generates all blocker masks for bishops
-    for rank in Rank.all():
-        for file in File.all():
+    for rank in Rank.items():
+        for file in File.items():
             # Generate all possible movement masks
             let
                 square = makeSquare(rank, file)
@@ -184,13 +184,11 @@ const
 
 func tryOffset(square: Square, df, dr: SomeInteger): Square =
     let
-        file = file(square)
-        rank = rank(square)
-    if file + pieces.File(df) notin pieces.File.all():
+        newFile = file(square).int + df
+        newRank = rank(square).int + dr
+    if newFile notin 0..7 or newRank notin 0..7:
         return nullSquare()
-    if rank + Rank(dr) notin Rank.all():
-        return nullSquare()
-    return makeSquare(rank + Rank(dr), file + pieces.File(df))
+    return makeSquare(newRank, newFile)
 
 
 proc getMoveset*(kind: PieceKind, square: Square, blocker: Bitboard): Bitboard =
@@ -202,7 +200,8 @@ proc getMoveset*(kind: PieceKind, square: Square, blocker: Bitboard): Bitboard =
     for (file, rank) in deltas:
         var ray = square
         while not blocker.contains(ray):
-            if (let shifted = ray.tryOffset(file, rank); shifted) != nullSquare():
+            let shifted = ray.tryOffset(file, rank)
+            if shifted != nullSquare():
                 ray = shifted
                 result = result or ray.toBitboard()
             else:
@@ -287,7 +286,7 @@ proc computeMagics*: int {.discardable.} =
     ## Fills in our magic number tables and returns
     ## the total number of iterations that were performed
     ## to find them
-    for square in Square.all():
+    for square in Square.items():
         var magic = findMagic(Rook, square, Rook.getRelevantBlockers(square).count().uint8)
         inc(result, magic.iterations)
         ROOK_MAGICS[square] = magic.entry
@@ -316,7 +315,7 @@ proc magicWizard* =
         rookTableCountNz = 0
         bishopTableSizeNz = 0
         bishopTableCountNz = 0
-    for sq in Square.all():
+    for sq in Square.items():
         var rookNonZero = 0
         var bishopNonZero = 0
         for bb in ROOK_MOVES[sq]:
@@ -352,6 +351,8 @@ proc magicWizard* =
 
 
 when not isMainModule:
+    {.push.}
+    {.hint[ConvFromXtoItselfNotNeeded]:off.}
     import pathX
 
     type
@@ -375,3 +376,5 @@ when not isMainModule:
     BISHOP_MAGICS = magics["bishops"]
     ROOK_MOVES = rookMoveData
     BISHOP_MOVES = bishopMoveData
+
+    {.pop.}

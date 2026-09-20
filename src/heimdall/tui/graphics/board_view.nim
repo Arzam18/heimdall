@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Authored with assistance from AI agents.
 
 ## Board rendering: composites pre-rendered piece images onto the
 ## board SVG and sends the result via the kitty graphics protocol.
@@ -234,7 +236,7 @@ proc threatArrowMoves(state: AppState): seq[BoardArrow] =
 
     let sideToMove = state.board.sideToMove()
     let attackerColor = sideToMove.opposite()
-    let threats = state.board.position.threats
+    let threats = state.board.threats()
 
     for sq in threats:
         let piece = state.board.on(sq)

@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Authored with assistance from AI agents.
 
 ## Composes the full TUI layout into an illwill TerminalBuffer
 
@@ -82,22 +84,6 @@ proc formatNodes(n: uint64): string =
 
 proc formatSpeed(n: uint64): string =
     formatNodes(n) & " nodes/sec"
-
-
-proc formatAnalysisTimeLimit(ms: int64): string =
-    if ms < 1000:
-        return &"{ms} ms"
-    if ms mod 1000 == 0 and ms < 60_000:
-        return &"{ms div 1000} s"
-    if ms < 60_000:
-        return &"{ms.float / 1000.0:.1f} s"
-    let totalSeconds = ms div 1000
-    let minutes = totalSeconds div 60
-    let seconds = totalSeconds mod 60
-    if seconds == 0:
-        &"{minutes} m"
-    else:
-        &"{minutes}m {seconds}s"
 
 
 proc formatCastling(board: Chessboard, chess960: bool): string =

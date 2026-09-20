@@ -1,3 +1,18 @@
+# Copyright 2026 Mattia Giambirtone & All Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import builtins
 import re
 import sys
 import subprocess
@@ -11,8 +26,11 @@ def main(args: Namespace) -> int:
     if args.silent:
         print = lambda *_: ...
     else:
-        print = __builtins__.print
+        print = builtins.print
     print("Heimdall move validator v0.0.1 by nocturn9x")
+    if args.ply < 1:
+        print("Comparison depth must be positive")
+        return 2
     try:
         STOCKFISH = (args.stockfish or Path(which("stockfish"))).resolve(strict=True)
     except Exception as e:
@@ -55,9 +73,9 @@ def main(args: Namespace) -> int:
     stockfish_output, stockfish_error = stockfish_process.communicate()
     heimdall_output, heimdall_error = heimdall_process.communicate()
     if heimdall_process.returncode != 0:
-        print(f"Heimdall crashed, stderr output below:\n{heimdall_error}")
+        print(f"Heimdall crashed, output below:\n{heimdall_output}")
     if stockfish_process.returncode != 0:
-        print(f"Stockfish crashed, stderr below:\n{stockfish_error}")
+        print(f"Stockfish crashed, output below:\n{stockfish_output}")
     if not all([stockfish_process.returncode == 0, heimdall_process.returncode == 0]):
         return 3
     positions = {
@@ -98,6 +116,17 @@ def main(args: Namespace) -> int:
     mistakes = sorted(list(mistakes))
     total_nodes = {"stockfish": sum(positions["stockfish"][move] for move in positions["stockfish"]),
                    "heimdall": sum(positions["heimdall"][move] for move in positions["heimdall"])}
+    # Empty or truncated output must not pass as two matching empty move lists.
+    # A terminal position is valid, but still has an explicit zero-node summary.
+    ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+    for engine, output, summary_pattern in (
+        ("stockfish", stockfish_output, r"^Nodes searched: +([0-9]+)\s*$"),
+        ("heimdall", heimdall_output, r"^Nodes searched \(bulk-counting: (?:on|off)\): +([0-9]+)\s*$"),
+    ):
+        summary = re.search(summary_pattern, ansi.sub("", output), re.MULTILINE)
+        if summary is None or int(summary.group(1)) != total_nodes[engine]:
+            print(f"Missing or inconsistent perft summary from {engine}:\n{output}")
+            return 2
     total_difference = total_nodes["stockfish"] - total_nodes["heimdall"]
     print(f"Stockfish searched {total_nodes['stockfish']} node{'' if total_nodes['stockfish'] == 1 else 's'}")
     print(f"Heimdall searched {total_nodes['heimdall']} node{'' if total_nodes['heimdall'] == 1 else 's'}")

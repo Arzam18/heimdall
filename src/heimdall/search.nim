@@ -63,7 +63,10 @@ type
     CaptureHistory*       = array[White..Black, array[Square.smallest()..Square.biggest(), array[Square.smallest()..Square.biggest(), array[Pawn..Queen, array[bool, array[bool, int16]]]]]]
     CounterMoves*         = array[Square.smallest()..Square.biggest(), array[Square.smallest()..Square.biggest(), Move]]
     KillerMoves*          = array[MAX_DEPTH, array[NUM_KILLERS, Move]]
-    ContinuationHistory*  = array[White..Black, array[Pawn..King, array[Square.smallest()..Square.biggest(), array[White..Black, array[Pawn..King, array[Square.smallest()..Square.biggest(), int16]]]]]]
+    ContinuationRow = array[White..Black, array[Pawn..King, array[Square.smallest()..Square.biggest(), int16]]]
+    # Preceding move first, candidate move last: sibling destinations share rows.
+    ContinuationHistory* = array[White..Black, array[Pawn..King, array[Square.smallest()..Square.biggest(), ContinuationRow]]]
+    ContinuationContext = array[3, ptr ContinuationRow]
 
     # The history tables are several megabytes of randomly-accessed data that
     # are hammered on every node of the search, so they are allocated on 2MB
@@ -105,6 +108,7 @@ type
 
     ChessVariation* = object
         moves*: array[MAX_DEPTH + 1, Move]
+        length*: int
         score*: Score
 
     SearchManager* = object
@@ -118,7 +122,7 @@ type
         historiesStore               : HugePtr[HistoryTablesObj]
         board                        : Chessboard
         evalStateStore               : EvalStateOwner
-        ttable                       : ptr TranspositionTable
+        ttable                       : TranspositionTable
         workerPool                   : WorkerPool
         workerCount                  : int
         searchMoves                  : seq[Move]
@@ -159,7 +163,7 @@ type
         manager   : SearchManager
         channels  : tuple[command: Channel[WorkerCommand], response: Channel[WorkerResponse]]
         isSetUp   : Atomic[bool]
-        ttable    : ptr TranspositionTable
+        ttable    : TranspositionTable
 
     WorkerPool* = object
         workers: seq[SearchWorker]
@@ -180,7 +184,7 @@ template evalState*(self: SearchManager): EvalState =
     self.evalStateStore.raw
 
 proc search*(self: var SearchManager, searchMoves: seq[Move] = @[], silent=false, ponder=false, minimal=false, variations=1): seq[ChessVariation] {.gcsafe.}
-proc newSearchManager*(positions: seq[Position], ttable: ptr TranspositionTable, parameters=getDefaultParameters(), mainWorker=true,
+proc newSearchManager*(positions: seq[Position], ttable: TranspositionTable, parameters=getDefaultParameters(), mainWorker=true,
                        chess960=false, evalState: sink EvalStateOwner = newEvalState(), state=newSearchState(), statistics=newSearchStatistics(),
                        normalizeScore: bool = true): SearchManager {.gcsafe.}
 proc setBoard*(self: SearchManager, state: seq[Position]) {.gcsafe.}
@@ -203,7 +207,6 @@ func clear*(histories: HistoryTables) =
         histories.nonpawnCorrHist[color][Black].clear()
         histories.majorCorrHist[color].clear()
         histories.minorCorrHist[color].clear()
-
 
 func createWorkerPool: WorkerPool = discard
 
@@ -323,7 +326,7 @@ proc computeLMRTable*(self: var SearchManager) {.gcsafe.} =
             self.lmrTable[i][j] = round(self.parameters.lmrBase + ln(i.float) * ln(j.float) * self.parameters.lmrMultiplier).int
 
 
-proc newSearchManager*(positions: seq[Position], ttable: ptr TranspositionTable, parameters=getDefaultParameters(), mainWorker=true,
+proc newSearchManager*(positions: seq[Position], ttable: TranspositionTable, parameters=getDefaultParameters(), mainWorker=true,
                        chess960=false, evalState: sink EvalStateOwner = newEvalState(), state=newSearchState(), statistics=newSearchStatistics(),
                        normalizeScore: bool = true): SearchManager {.gcsafe.} =
     when isTuningEnabled:
@@ -335,6 +338,7 @@ proc newSearchManager*(positions: seq[Position], ttable: ptr TranspositionTable,
     result.historiesStore = allocHugePage[HistoryTablesObj]()
     result.histories.clear()
     result.state.normalizeScore.store(normalizeScore, moRelaxed)
+    result.state.prettyPVLength.store(DEFAULT_PRETTY_PV_LENGTH, moRelaxed)
     result.state.chess960.store(chess960, moRelaxed)
     result.state.isMainThread.store(mainWorker, moRelaxed)
     result.limiter    = newSearchLimiter(result.state, result.statistics)
@@ -388,6 +392,10 @@ proc startSearch(self: WorkerPool, searchMoves: seq[Move], variations, totalThre
         # is enqueued, means a late worker observes any subsequent stop() and
         # bails immediately.
         worker.manager.state.stop.store(false, moRelaxed)
+        # Workers are idle here. Clear stale totals before dispatch: the main
+        # thread can check a new node limit before a worker dequeues Go and runs
+        # its own initialization.
+        worker.manager.statistics.nodeCount.store(0, moRelaxed)
         worker.go(searchMoves, variations, totalThreads)
 
 
@@ -413,7 +421,10 @@ proc setBoard*(self: SearchManager, state: seq[Position]) {.gcsafe.} =
             worker.manager.board.positions.add(position.clone())       
         # newEvalState and init() are expensive, no
         # need to run them for every thread!
-        worker.manager.evalStateStore = self.evalState.clone(worker.manager.board)
+        if worker.manager.evalState == nil:
+            worker.manager.evalStateStore = self.evalState.clone(worker.manager.board)
+        else:
+            worker.manager.evalState.copyFrom(self.evalState, worker.manager.board)
 
 
 when isTuningEnabled:
@@ -437,7 +448,10 @@ proc setNetwork*(self: var SearchManager, path: string) =
     # newEvalState and init() are expensive, no
     # need to run them for every thread!
     for worker in self.workerPool.workers:
-        worker.manager.evalStateStore = self.evalState.clone(worker.manager.board)
+        if worker.manager.evalState == nil:
+            worker.manager.evalStateStore = self.evalState.clone(worker.manager.board)
+        else:
+            worker.manager.evalState.copyFrom(self.evalState, worker.manager.board)
 
 
 func stopped(self: SearchManager):         bool          {.inline.} = self.state.stop.load(moRelaxed)
@@ -484,10 +498,10 @@ func isCounterMove(self: SearchManager, move: Move, ply: int): bool {.inline.} =
     return move == self.histories.counterMoves[prevMove.startSquare][prevMove.targetSquare]
 
 
-func historyScore(self: SearchManager, sideToMove: PieceColor, move: Move): int16 {.inline.} =
+func historyScore(self: SearchManager, sideToMove: PieceColor, move: Move, threats: Bitboard): int16 {.inline.} =
     assert move.isCapture() or move.isQuiet()
-    let startAttacked = self.board.position.threats.contains(move.startSquare)
-    let targetAttacked = self.board.position.threats.contains(move.targetSquare)
+    let startAttacked = threats.contains(move.startSquare)
+    let targetAttacked = threats.contains(move.targetSquare)
     if move.isQuiet():
         result = self.histories.quietHistory[sideToMove][move.startSquare][move.targetSquare][startAttacked][targetAttacked]
     else:
@@ -499,7 +513,7 @@ func conthistScore(self: SearchManager, sideToMove: PieceColor, piece: Piece, ta
     ## Returns the score stored in the continuation history dst
     ## plies ago (does not check for out of bounds access)
     let prevPiece = self.stack[ply - dst].piece
-    result += self.histories.continuationHistory[sideToMove][piece.kind][target][prevPiece.color][prevPiece.kind][self.stack[ply - dst].move.targetSquare]
+    result += self.histories.continuationHistory[prevPiece.color][prevPiece.kind][self.stack[ply - dst].move.targetSquare][sideToMove][piece.kind][target]
 
 
 func conthistScore(self: SearchManager, sideToMove: PieceColor, piece: Piece, target: Square, ply: int): Score {.inline.} =
@@ -510,10 +524,16 @@ func conthistScore(self: SearchManager, sideToMove: PieceColor, piece: Piece, ta
             result += self.conthistScore(sideToMove, piece, target, ply, dst + 1)
 
 
-func gravity(bonus: int, score: Score): int16 {.inline.} =
-    ## Applies the gravity formula to evenly spread the improvement
-    ## while keeping it constrained to avoid overflow
-    (bonus - abs(bonus) * score div HISTORY_SCORE_CAP).int16
+proc updateHistory(entry: var int16, bonus: int) {.inline.} =
+    ## Applies bounded gravity to this entry, narrowing only the final value:
+    ## a delta between opposite history bounds need not fit in int16.
+    const cap = int32(HISTORY_SCORE_CAP)
+    let
+        b = int32(clamp(bonus, -HISTORY_SCORE_CAP, HISTORY_SCORE_CAP))
+        h = int32(entry)
+        updated = h + b - h * abs(b) div cap
+    assert updated >= -cap and updated <= cap
+    entry = int16(updated)
 
 
 proc updateHistories(self: SearchManager, sideToMove: PieceColor, move: Move, piece: Piece, depth, ply: int, good: bool) {.inline.} =
@@ -522,33 +542,35 @@ proc updateHistories(self: SearchManager, sideToMove: PieceColor, move: Move, pi
     ## either high or low depending on whether good is true
     ## or false
     assert move.isCapture() or move.isQuiet()
-    let startAttacked = self.board.position.threats.contains(move.startSquare)
-    let targetAttacked = self.board.position.threats.contains(move.targetSquare)
+    let threats = self.board.threats()
+    let startAttacked = threats.contains(move.startSquare)
+    let targetAttacked = threats.contains(move.targetSquare)
     if move.isQuiet():
-        let conthistScore = self.conthistScore(sideToMove, piece, move.targetSquare, ply)
         if ply > 0 and not self.board.positions[^2].fromNull:
             let prevPiece = self.stack[ply - 1].piece
             let bonus = (if good: self.parameters.moveBonuses.conthist.ply1.good else: -self.parameters.moveBonuses.conthist.ply1.bad) * depth
-            self.histories.continuationHistory[sideToMove][piece.kind][move.targetSquare][prevPiece.color][prevPiece.kind][self.stack[ply - 1].move.targetSquare] += gravity(bonus, conthistScore)
+            updateHistory(self.histories.continuationHistory[prevPiece.color][prevPiece.kind][self.stack[ply - 1].move.targetSquare][sideToMove][piece.kind][move.targetSquare], bonus)
         if ply > 1 and not self.board.positions[^3].fromNull:
-          let prevPiece = self.stack[ply - 2].piece
-          let bonus = (if good: self.parameters.moveBonuses.conthist.ply2.good else: -self.parameters.moveBonuses.conthist.ply2.bad) * depth
-          self.histories.continuationHistory[sideToMove][piece.kind][move.targetSquare][prevPiece.color][prevPiece.kind][self.stack[ply - 2].move.targetSquare] += gravity(bonus, conthistScore)
+            let prevPiece = self.stack[ply - 2].piece
+            let bonus = (if good: self.parameters.moveBonuses.conthist.ply2.good else: -self.parameters.moveBonuses.conthist.ply2.bad) * depth
+            updateHistory(self.histories.continuationHistory[prevPiece.color][prevPiece.kind][self.stack[ply - 2].move.targetSquare][sideToMove][piece.kind][move.targetSquare], bonus)
         if ply > 3 and not self.board.positions[^5].fromNull:
-          let prevPiece = self.stack[ply - 4].piece
-          let bonus = (if good: self.parameters.moveBonuses.conthist.ply4.good else: -self.parameters.moveBonuses.conthist.ply4.bad) * depth
-          self.histories.continuationHistory[sideToMove][piece.kind][move.targetSquare][prevPiece.color][prevPiece.kind][self.stack[ply - 4].move.targetSquare] += gravity(bonus, conthistScore)
+            let prevPiece = self.stack[ply - 4].piece
+            let bonus = (if good: self.parameters.moveBonuses.conthist.ply4.good else: -self.parameters.moveBonuses.conthist.ply4.bad) * depth
+            updateHistory(self.histories.continuationHistory[prevPiece.color][prevPiece.kind][self.stack[ply - 4].move.targetSquare][sideToMove][piece.kind][move.targetSquare], bonus)
 
         let bonus = (if good: self.parameters.moveBonuses.quiet.good else: -self.parameters.moveBonuses.quiet.bad) * depth
-        self.histories.quietHistory[sideToMove][move.startSquare][move.targetSquare][startAttacked][targetAttacked] += gravity(bonus, self.historyScore(sideToMove, move))
+        updateHistory(self.histories.quietHistory[sideToMove][move.startSquare][move.targetSquare][startAttacked][targetAttacked], bonus)
 
     elif move.isCapture():
         let bonus = (if good: self.parameters.moveBonuses.capture.good else: -self.parameters.moveBonuses.capture.bad) * depth
         let victim = self.board.on(move.captureSquare()).kind
-        self.histories.captureHistory[sideToMove][move.startSquare][move.targetSquare][victim][startAttacked][targetAttacked] += gravity(bonus, self.historyScore(sideToMove, move))
+        updateHistory(self.histories.captureHistory[sideToMove][move.startSquare][move.targetSquare][victim][startAttacked][targetAttacked], bonus)
 
 
-proc scoreMove(self: SearchManager, hashMove: Move, move: Move, ply: int): ScoredMove {.inline.} =
+proc scoreMove(self: SearchManager, hashMove: Move, move: Move, threats: Bitboard,
+               ply: int, context: ContinuationContext,
+               qsearch: static bool = false): ScoredMove {.inline.} =
     ## Returns an estimated static score for the move, used
     ## during move ordering
     result.move = move
@@ -556,14 +578,17 @@ proc scoreMove(self: SearchManager, hashMove: Move, move: Move, ply: int): Score
         result.data = TTMOVE_OFFSET or HashMove.int32 shl 24
         return
 
-    if ply > 0:
-        if self.isKillerMove(move, ply):
-            result.data = KILLERS_OFFSET or KillerMove.int32 shl 24
-            return
+    # Quiescence requests only captures. Killer moves and countermoves are
+    # recorded from non-captures, so their table probes cannot match here.
+    when not qsearch:
+        if ply > 0:
+            if self.isKillerMove(move, ply):
+                result.data = KILLERS_OFFSET or KillerMove.int32 shl 24
+                return
 
-        if self.isCounterMove(move, ply):
-            result.data = COUNTER_OFFSET or CounterMove.int32 shl 24
-            return
+            if self.isCounterMove(move, ply):
+                result.data = COUNTER_OFFSET or CounterMove.int32 shl 24
+                return
 
     let sideToMove = self.board.sideToMove
 
@@ -571,7 +596,7 @@ proc scoreMove(self: SearchManager, hashMove: Move, move: Move, ply: int): Score
     if move.isTactical():
         let winning = self.parameters.see(self.board.position, move, 0, SeeOrdering)
         if move.isCapture():
-            result.data += self.historyScore(sideToMove, move)
+            result.data += self.historyScore(sideToMove, move, threats)
             # Prioritize attacking our opponent's
             # most valuable pieces
             result.data += MVV_MULTIPLIER * self.parameters.staticPieceScore(self.board.on(move.captureSquare())).int32
@@ -585,19 +610,35 @@ proc scoreMove(self: SearchManager, hashMove: Move, move: Move, ply: int): Score
             result.data = result.data or GoodNoisy.int32 shl 24
             return
 
-    if move.isQuiet():
-        result.data = QUIET_OFFSET + self.historyScore(sideToMove, move).int32 + self.conthistScore(sideToMove, self.board.on(move.startSquare), move.targetSquare, ply)
-        result.data = result.data or QuietMove.int32 shl 24
+    when not qsearch:
+        if move.isQuiet():
+            let piece = self.board.on(move.startSquare)
+            var continuation: Score
+            for row in context:
+                if row != nil:
+                    continuation += row[][sideToMove][piece.kind][move.targetSquare]
+            result.data = QUIET_OFFSET + self.historyScore(sideToMove, move, threats).int32 + continuation
+            result.data = result.data or QuietMove.int32 shl 24
 
 
-iterator pickMoves(self: SearchManager, hashMove: Move, ply: int, qsearch: bool = false): ScoredMove =
+iterator pickMoves(self: SearchManager, hashMove: Move, ply: int,
+                   qsearch: static bool = false): ScoredMove =
     ## Abstracts movegen away from search by picking moves using
     ## our move orderer
     var moves {.noinit.} = newMoveList()
     self.board.generateMoves(moves, capturesOnly=qsearch)
+    let threats = if moves.len() > 0: self.board.threats() else: Bitboard(0)
+    var context: ContinuationContext
+    when not qsearch:
+        # Every sibling uses the same preceding moves. Resolve their history
+        # rows once instead of recalculating six-dimensional indices per move.
+        for index, distance in [1, 2, 4]:
+            if ply >= distance:
+                let previous = self.stack[ply - distance]
+                context[index] = addr self.histories.continuationHistory[previous.piece.color][previous.piece.kind][previous.move.targetSquare]
     var scoredMoves {.noinit.}: array[MAX_MOVES, ScoredMove]
     for i in 0..moves.high():
-        scoredMoves[i] = self.scoreMove(hashMove, moves[i], ply)
+        scoredMoves[i] = self.scoreMove(hashMove, moves[i], threats, ply, context, qsearch)
     # Incremental selection sort: we lazily sort the move list
     # as we yield elements from it, which is on average faster than
     # sorting the entire move list due to the fact that, thanks to our
@@ -679,7 +720,7 @@ proc getReduction(self: SearchManager, move: Move, depth, ply, moveNumber: int, 
         if move.isQuiet() or move.isCapture():
             let stm = self.board.sideToMove
             let piece = self.board.on(move.startSquare)
-            var score: int = self.historyScore(stm, move)
+            var score: int = self.historyScore(stm, move, self.board.threats())
             if move.isQuiet():
                 score += self.conthistScore(stm, piece, move.targetSquare, ply)
                 score = score * QUANTIZATION_FACTOR div self.parameters.historyLmrDivisor.quiet
@@ -942,7 +983,7 @@ proc qsearch(self: var SearchManager, root: static bool, ply: int, alpha, beta: 
         self.evalState.update(move, self.board.sideToMove, self.stack[ply].piece.kind, self.board.on(move.captureSquare()).kind, kingSq)
         self.board.doMove(move)
         discard self.statistics.nodeCount.fetchAdd(1, moRelaxed)
-        prefetch(addr self.ttable.data[getIndex(self.ttable[], self.board.zobristKey)], cint(0), cint(3))
+        prefetch(addr self.ttable.data[self.ttable.getIndex(self.board.zobristKey)], cint(0), cint(3))
         let score = -self.qsearch(false, ply + 1, -beta, -alpha, isPV)
         self.board.unmakeMove()
         self.evalState.undo()
@@ -982,8 +1023,29 @@ func storeKillerMove(self: SearchManager, ply: int, move: Move) {.inline.} =
     self.histories.killerMoves[ply][0] = move
 
 
+func updatePV(self: var SearchManager, ply: int, move: Move) {.inline.} =
+    let childLength = self.variations[ply + 1].length
+    doAssert childLength in 0..self.variations[ply].moves.high()
+    doAssert self.variations[ply + 1].moves[childLength] == nullMove()
+
+    self.variations[ply].moves[0] = move
+    for i in 0..<childLength:
+        self.variations[ply].moves[i + 1] = self.variations[ply + 1].moves[i]
+    self.variations[ply].length = childLength + 1
+    if self.variations[ply].length <= self.variations[ply].moves.high():
+        self.variations[ply].moves[self.variations[ply].length] = nullMove()
+
+
+func setPVMove(self: var SearchManager, ply: int, move: Move) {.inline.} =
+    ## Records a move without borrowing a continuation from a non-PV search.
+    self.variations[ply].moves[0] = move
+    self.variations[ply].moves[1] = nullMove()
+    self.variations[ply].length = 1
+
+
 func clearPV(self: var SearchManager, ply: int) {.inline.} =
     self.variations[ply].moves[0] = nullMove()
+    self.variations[ply].length = 0
 
 
 func clearKillers(self: SearchManager, ply: int) {.inline.} =
@@ -1210,6 +1272,8 @@ proc search(self: var SearchManager, depth, ply: int, alpha, beta: Score, isPV, 
                         let verifiedScore = self.search(depth - reduction, ply, beta - 1, beta, isPV=false, root=false, cutNode=true)
                         # Re-enable NMP
                         self.minNmpPly = 0
+                        if self.shouldStop():
+                            return Score(0)
                         # Verification search failed high: we're safe to prune
                         if verifiedScore >= beta:
                             return (if not verifiedScore.isMateScore(): verifiedScore else: beta)
@@ -1302,6 +1366,8 @@ proc search(self: var SearchManager, depth, ply: int, alpha, beta: Score, isPV, 
                     newDepth = (depth - SE_REDUCTION_OFFSET) div SE_REDUCTION_DIVISOR
                     # This is basically a big comparison, asking "is there any move better than the TT move?"
                     singularScore = self.search(newDepth, ply, newAlpha, newBeta, isPV=false, root=false, cutNode=cutNode, excluded=hashMove)
+                if self.shouldStop():
+                    return Score(0)
                 if singularScore < newBeta:
                     # Search failed low, hash move is singular: explore it deeper
                     inc(singular)
@@ -1338,7 +1404,7 @@ proc search(self: var SearchManager, depth, ply: int, alpha, beta: Score, isPV, 
         var score: Score
         # Prefetch next TT entry: 0 means read, 3 means the value has high temporal locality
         # and should be kept in all possible cache levels if possible
-        prefetch(addr self.ttable.data[getIndex(self.ttable[], self.board.zobristKey)], cint(0), cint(3))
+        prefetch(addr self.ttable.data[self.ttable.getIndex(self.board.zobristKey)], cint(0), cint(3))
         # Implementation of Principal Variation Search (PVS)
         if seenMoves == 0:
             # Due to our move ordering scheme, the first move is assumed to be the best, so
@@ -1379,6 +1445,9 @@ proc search(self: var SearchManager, depth, ply: int, alpha, beta: Score, isPV, 
         when root:
             let nodesAfter = self.statistics.nodeCount.load(moRelaxed)
             self.statistics.spentNodes[move.startSquare][move.targetSquare].atomicInc(nodesAfter - nodesBefore)
+            # Prevent empty root PVs
+            if seenMoves == 1:
+                self.updatePV(ply, move)
         self.board.unmakeMove()
         self.evalState.undo()
         bestScore = max(score, bestScore)
@@ -1395,16 +1464,13 @@ proc search(self: var SearchManager, depth, ply: int, alpha, beta: Score, isPV, 
             when root:
                 self.statistics.bestRootScore.store(score, moRelaxed)
                 self.statistics.bestMove.store(bestMove, moRelaxed)
-            if score < beta:
-                when isPV:
-                    # This loop is why variations has one extra entry.
-                    # We can just do ply + 1 and i + 1 without ever
-                    # fearing about buffer overflows
-                    for i, pvMove in self.variations[ply + 1].moves:
-                        self.variations[ply].moves[i + 1] = pvMove
-                        if pvMove == nullMove():
-                            break
-                    self.variations[ply].moves[0] = move
+            when isPV:
+                if seenMoves > 1 and score >= beta:
+                    # Later moves that fail high have only been searched with a
+                    # null window, so the child PV slot contains a stale line.
+                    self.setPVMove(ply, move)
+                else:
+                    self.updatePV(ply, move)
         if score >= beta:
             # This move was too good for us, opponent will not search it
             when not root:
@@ -1488,7 +1554,7 @@ proc startClock*(self: var SearchManager) =
     self.clockStarted.store(true, moRelaxed)
 
 
-proc aspirationSearch(self: var SearchManager, depth: int, score: Score): Score {.inline.} =
+proc aspirationSearch(self: var SearchManager, depth: int, score: Score, shouldLog: bool): Score {.inline.} =
     var
         delta = Score(self.parameters.aspWindowInitialSize)
         alpha = max(-SCORE_INF, score - delta)
@@ -1499,13 +1565,20 @@ proc aspirationSearch(self: var SearchManager, depth: int, score: Score): Score 
     if mateDepth > 0:
         alpha = mateIn(mateDepth * 2 - 1)
         beta = mateIn(0)
+    let currentVariation = self.statistics.currentVariation.load(moRelaxed)
     while true:
-        score = self.search(depth - reduction, 0, alpha, beta, true, true, false)
+        # Root retries must search a move. At depth zero, quiescence can return
+        # a TT score/stand pat without a PV, causing iterative deepening to stop
+        # before its limits expire (especially with a warm, shared TT).
+        score = self.search(max(1, depth - reduction), 0, alpha, beta, true, true, false)
         if self.shouldStop():
             break
         # Score is outside window bounds, widen the one that
         # we got past to get a better result
         if score <= alpha:
+            if shouldLog:
+                self.logger.log(self.variations[0].moves, self.variations[0].length, currentVariation,
+                                some(alpha), scoreType=Upper)
             # Grow the window downward as well when we fail
             # low (cuts off faster)
             beta = (alpha + beta) div 2
@@ -1516,6 +1589,10 @@ proc aspirationSearch(self: var SearchManager, depth: int, score: Score): Score 
             # Try again with larger window
             delta = Score(delta * self.parameters.aspWindowWideningFactor.failLow div 128)
         elif score >= beta:
+            if shouldLog:
+                # PV doesn't matter on a fail high
+                self.logger.log(self.variations[0].moves, self.variations[0].length, currentVariation,
+                                some(beta), scoreType=Lower)
             beta = min(SCORE_INF, score + delta)
             # Whenever we fail high, reduce the search depth as we
             # expect the score to be good for our opponent anyway
@@ -1585,8 +1662,8 @@ proc search*(self: var SearchManager, searchMoves: seq[Move] = @[], silent=false
     self.state.cancelled.store(false, moRelaxed)
     self.expired = false
 
-    for i in Square.all():
-        for j in Square.all():
+    for i in Square.items():
+        for j in Square.items():
             self.statistics.spentNodes[i][j].store(0, moRelaxed)
 
     var score = Score(0)
@@ -1597,7 +1674,9 @@ proc search*(self: var SearchManager, searchMoves: seq[Move] = @[], silent=false
     if variations > 1:
         self.board.generateMoves(legalMoves)
         if searchMoves.len() > 0:
-            variations = min(variations, searchMoves.len())
+            variations = min(variations, min(searchMoves.len(), legalMoves.len()))
+        else:
+            variations = min(variations, legalMoves.len())
 
     var lastInfoLine = false
 
@@ -1605,6 +1684,7 @@ proc search*(self: var SearchManager, searchMoves: seq[Move] = @[], silent=false
     for i in 0..<variations:
         for j in 0..MAX_DEPTH:
             self.previousVariations[i].moves[j] = nullMove()
+        self.previousVariations[i].length = 0
         self.previousVariations[i].score = Score(0)
 
     let totalThreads = self.workerCount + 1
@@ -1629,8 +1709,8 @@ proc search*(self: var SearchManager, searchMoves: seq[Move] = @[], silent=false
                     # Aspiration windows: start subsequent searches with tighter
                     # alpha-beta bounds and widen them as needed (i.e. when the score
                     # goes beyond the window) to increase the number of cutoffs
-                    score = self.aspirationSearch(depth, score)
-                if self.shouldStop() or self.variations[0].moves[0] == nullMove():
+                    score = self.aspirationSearch(depth, score, not minimal and self.limiter.elapsedMsec() >= 3000)
+                if self.shouldStop() or self.variations[0].length == 0:
                     # Search has likely been interrupted mid-tree:
                     # cannot trust partial results
                     lastInfoLine = self.stopped() or self.limiter.hardLimitReached()
@@ -1645,8 +1725,8 @@ proc search*(self: var SearchManager, searchMoves: seq[Move] = @[], silent=false
                 self.statistics.variationScores[i - 1].store(score, moRelaxed)
                 self.statistics.variationMoves[i - 1].store(self.variations[0].moves[0], moRelaxed)
                 self.statistics.variationCount.store(i, moRelaxed)
-                if not silent and not minimal:
-                    self.logger.log(self.variations[0].moves, i)
+                if not minimal:
+                    self.logger.log(self.variations[0].moves, self.variations[0].length, i)
                 if variations > 1:
                     self.searchMoves = searchMoves
                     for move in legalMoves:
@@ -1654,8 +1734,10 @@ proc search*(self: var SearchManager, searchMoves: seq[Move] = @[], silent=false
                             # If the user told us to only search a specific set
                             # of moves, don't override that
                             continue
-                        if move in bestMoves:
+                        if move in bestMoves and i < variations:
                             # Don't search the current best move(s) in the next search
+                            # unless we're at the very end of this ID iteration (otherwise
+                            # we would ignore the best move forever)
                             continue
                         self.searchMoves.add(move)
             bestMoves.setLen(0)
@@ -1706,7 +1788,7 @@ proc search*(self: var SearchManager, searchMoves: seq[Move] = @[], silent=false
 
     if not silent and (lastInfoLine or minimal):
         # Log final info message
-        self.logger.log(result[0].moves, 1, some(finalScore), some(stats))
+        self.logger.log(result[0].moves, result[0].length, 1, some(finalScore), some(stats))
 
     # Clear all state a subsequent search depends on *before* publishing
     # searching=false, which is the flag the dispatching thread gates the

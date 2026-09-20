@@ -33,15 +33,21 @@ type
         Empty = 6    # No piece
 
     Piece* = object
-        color*: PieceColor
-        kind*: PieceKind
+        # Piece information is packed into 8 bits as {unused:3}{color:2}{kind:3}.
+        data: uint8
 
     SignedDistance* = distinct range[-7'i8..7'i8]
     File*   = distinct range[0'u8..7'u8]
     Rank*   = distinct range[0'u8..7'u8]
     Square* = distinct range[0'u8..64'u8]
 
+{.push.}
+# Nim is big stupid and we need operators that work on more than
+# just the type itself.
+when (NimMajor, NimMinor, NimPatch) >= (2, 2, 12):
+    {.warning[InvalidCmpOp]:off.}
 
+func asInt*(self: Piece): uint8 = self.data
 # Boy oh boy am I glad we have generics. So much code space saved!
 func `xor`*[T: Rank | File | Square](a: T, b: uint8): T {.inline.} = T(a.uint8 xor b)
 func `and`*[T: Rank | File | Square](a: T, b: uint8): T {.inline.} = T(a.uint8 and b)
@@ -84,6 +90,8 @@ func signedDistance*[T: Rank | File](a, b: T): SignedDistance {.inline.} = Signe
 func abs*(a: SignedDistance): SignedDistance {.inline.} = SignedDistance(abs(a.int))
 func absDistance*[T: Rank | File](a, b: T): T {.inline.} = T(abs(signedDistance(a, b)))
 
+{.pop.}
+
 const opposites: array[White..Black, PieceColor] = [Black, White]
 
 func makeSquare*(rank: Rank, file: File): Square {.inline.} = Square((rank.uint8 * 8) + file.uint8)
@@ -97,7 +105,56 @@ func biggest*(T: typedesc[Square]): Square {.inline.} = Square(63)
 func all*(T: typedesc[Square]): auto = T.smallest()..T.biggest()
 func all*[T: File | Rank](x: typedesc[T]): auto = x.low()..x.high()
 func all*(self: typedesc[PieceKind]): auto = Pawn..King
-func nullPiece*: Piece {.inline.} = Piece(kind: Empty, color: None)
+
+iterator items*(T: typedesc[File]): File =
+    for value in 0'u8..7'u8:
+        yield File(value)
+
+iterator items*(T: typedesc[Rank]): Rank =
+    for value in 0'u8..7'u8:
+        yield Rank(value)
+
+iterator items*(T: typedesc[Square]): Square =
+    for value in 0'u8..63'u8:
+        yield Square(value)
+
+func createPiece*(kind: PieceKind, color: PieceColor): Piece {.inline.} =
+    ## Creates a packed piece, including the Empty and None sentinel values.
+    result = Piece(data: (color.uint8 shl 3) or kind.uint8)
+    when defined(debug):
+        # Couldn't decide between 6 and 7
+        result.data = result.data or (7'u8 shl 5)
+
+func createPiece*(data: uint8): Piece {.inline.} =
+    ## Creates a packed piece, from the given
+    ## already packed data
+    result = Piece(data: data)
+    when defined(debug):
+        # Couldn't decide between 6 and 7
+        result.data = result.data or (7'u8 shl 5)
+
+when defined(debug):
+    func `==`*(a, b: Piece): bool {.inline.} =
+        # Ignore padding so zero-initialized pieces retain their equality semantics.
+        (a.data and 0x1f) == (b.data and 0x1f)
+
+func kind*(self: Piece): PieceKind {.inline.} =
+    ## Returns the piece kind.
+    PieceKind(self.data and 0x7)
+
+func color*(self: Piece): PieceColor {.inline.} =
+    ## Returns the piece color.
+    PieceColor((self.data shr 3) and 0x3)
+
+func `kind=`*(self: var Piece, kind: PieceKind) {.inline.} =
+    ## Changes the kind while preserving the color.
+    self.data = (self.data and 0xf8) or kind.uint8
+
+func `color=`*(self: var Piece, color: PieceColor) {.inline.} =
+    ## Changes the color while preserving the kind.
+    self.data = (self.data and 0xe7) or (color.uint8 shl 3)
+
+func nullPiece*: Piece {.inline.} = createPiece(Empty, None)
 func nullSquare*: Square {.inline.} = Square(64'u8)
 func opposite*(c: PieceColor): PieceColor {.inline.} = return opposites[c]
 func isLightSquare*(a: Square): bool {.inline.} = (a and 2) == 0
@@ -271,4 +328,4 @@ func fromChar*(c: char): Piece {.inline.} =
             discard
     if c.isUpperAscii():
         color = White
-    result = Piece(kind: kind, color: color)
+    result = createPiece(kind=kind, color=color)

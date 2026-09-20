@@ -15,10 +15,12 @@
 
 # Thanks @analog-hors for the contribution! The code below is heavily derived from hers :)
 import heimdall/pieces
+import heimdall/threats/index
 import heimdall/util/memory/aligned
 
 import std/endians
 import std/streams
+import heimdall/util/simd_dispatch
 
 
 when defined(simd):
@@ -41,14 +43,18 @@ const
     FT_QUANT_BITS* {.define: "ftQuantBits".} = 8
     QA* = (1 shl FT_QUANT_BITS) - 1
     L1_QUANT_BITS* {.define: "l1QuantBits".} = 7
+    # Rescale disk biases into the pre-shift space used by inference.
+    L1_BIAS_SHIFT* {.define: "l1BiasShift".} = 0
     QUANT_BITS* {.define: "quantBits".} = 6
     FT_SCALE_BITS* {.define: "ftScaleBits".} = 7
+    QB* = 1 shl QUANT_BITS
+    SINGLE_LAYER* {.booldefine: "singleLayer".} = false
     # Number of king input buckets
     NUM_INPUT_BUCKETS* {.define: "inputBuckets".} = 4
     NUM_OUTPUT_BUCKETS* {.define: "outputBuckets".} = 8
     MERGED_KINGS* {.booldefine: "mergedKings".} = true
     MIRRORED* {.booldefine: "horizontalMirroring".} = true
-    VERBATIM_NET* {.booldefine: "verbatimNet".} = true
+    VERBATIM_NET* {.booldefine: "verbatimNet".} = false
     DUAL_ACTIVATION* {.booldefine: "dualActivation".} = true
     NET_ID* {.define: "netID".} = ""
     # LUT mapping king square to buckets (it's mirrored
@@ -81,7 +87,15 @@ when not (QA + 1).isPowerOfTwo():
     {.fatal: &"L1 quantization must be a power of 2 minus one (got {QA} instead)".}
 
 
+when VERBATIM_NET:
+    {.fatal: "TI networks must be loaded field by field; use VERBATIM_NET=0".}
+
+
 type
+    TransposedInt16Layer*[I, O: static[int]] = object
+        weight* {.align(ALIGNMENT_BOUNDARY).}: array[O, array[I, int16]]
+        bias* {.align(ALIGNMENT_BOUNDARY).}: array[O, int16]
+
     Int32Layer*[I, O: static[int]] = object
         weight* {.align(ALIGNMENT_BOUNDARY).}: array[I, array[O, int32]]
         bias* {.align(ALIGNMENT_BOUNDARY).}: array[O, int32]
@@ -97,16 +111,23 @@ type
         weight* {.align(ALIGNMENT_BOUNDARY).}: array[B, array[I * O, int8]]
         bias* {.align(ALIGNMENT_BOUNDARY).}: array[B, array[O, int32]]
 
+    ThreatWeights* = array[TOTAL_THREATS, array[L1_SIZE, int8]]
+
     Network* = object
         ft*: Int16Layer[FT_SIZE * NUM_INPUT_BUCKETS, L1_SIZE]
-        # This is ugly, but since our indexing scheme into the L1 is not
-        # representable with a 2D array (the dimensions are interleaved),
-        # we must sacrifice abstraction for speed. The data is ordered the
-        # way dpbusd expects it to be, so we have to adapt ourselves
-        l1*: BucketedL1[NUM_OUTPUT_BUCKETS, L1_SIZE, L2_SIZE]
-        # We multiply the L2 size by 2 because we do dual activations
-        l2*: Bucketed[NUM_OUTPUT_BUCKETS, Int32Layer[(L2_SIZE * (1 + DUAL_ACTIVATION.int)), L3_SIZE]]
-        l3*: Bucketed[NUM_OUTPUT_BUCKETS, Int32Layer[L3_SIZE, 1]]
+        threatWeights* {.align(ALIGNMENT_BOUNDARY).}: ThreatWeights
+        when SINGLE_LAYER:
+            output*: TransposedInt16Layer[L1_SIZE * 2, NUM_OUTPUT_BUCKETS]
+        else:
+            # This is ugly, but since our indexing scheme into the L1 is not
+            # representable with a 2D array (the dimensions are interleaved),
+            # we must sacrifice abstraction for speed. The data is ordered the
+            # way dpbusd expects it to be, so we have to adapt ourselves
+            l1*: BucketedL1[NUM_OUTPUT_BUCKETS, L1_SIZE, L2_SIZE]
+            # We multiply the L2 size by 2 because we do dual activations
+            l2*: Bucketed[NUM_OUTPUT_BUCKETS, Int32Layer[(L2_SIZE * (1 + DUAL_ACTIVATION.int)), L3_SIZE]]
+            l3*: Bucketed[NUM_OUTPUT_BUCKETS, Int32Layer[L3_SIZE, 1]]
+
 
     UpdateQueue* = object
         adds: array[2, int]
@@ -124,41 +145,66 @@ proc readLittleInt16(stream: Stream): int16 {.inline.} =
     littleEndian16(addr result, addr raw)
 
 
+proc writeLittleInt16(stream: Stream, value: int16) {.inline.} =
+    var raw: int16
+    littleEndian16(addr raw, unsafeAddr value)
+    stream.writeData(addr raw, sizeof(raw))
+
+
 proc readLittleInt32(stream: Stream): int32 {.inline.} =
     var raw = stream.readInt32()
     littleEndian32(addr result, addr raw)
 
 
 
-const
-    FT_GROUP_PERM = block:
-        when defined(simd) and defined(avx512):
+proc writeLittleInt32(stream: Stream, value: int32) {.inline.} =
+    var raw: int32
+    littleEndian32(addr raw, unsafeAddr value)
+    stream.writeData(addr raw, sizeof(raw))
+
+
+when not SINGLE_LAYER:
+    const
+        # CJ's packing schedule lets every backend use the AVX-512 ordering.
+        # These are four-byte input groups; PSQ/TI accumulator lanes stay canonical.
+        # Small debugging architectures use the canonical layout and scalar head.
+        FT_GROUP_PERM = when L1_SIZE mod 128 == 0:
             [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15]
-        elif defined(simd) and defined(avx2):
-            [0, 1, 4, 5, 2, 3, 6, 7]
         else:
             [0]
 
 
-# Shamelessly LLM translated from https://github.com/JonathanHallstrom/pawnocchio/blob/pp/src/nnue/outputs/multilayer.zig#L41
-# Seriously this is black magic shit
-proc transform(net: var Network, l1wDisk: var L1WeightDisk, l2wDisk: var L2WeightDisk, l3wDisk: var L3WeightDisk) =
-    ## Transforms Bullet's disk weight layout into the layout used for inference.
-    for bucket in 0..<NUM_OUTPUT_BUCKETS:
-        for i in 0..<L1_SIZE div 4:
-            let src = (i div FT_GROUP_PERM.len) * FT_GROUP_PERM.len + FT_GROUP_PERM[i mod FT_GROUP_PERM.len]
-            for j in 0..<L2_SIZE:
-                for k in 0..<4:
-                    net.l1.weight[bucket][i * 4 * L2_SIZE + j * 4 + k] = l1wDisk[src * 4 + k][bucket][j]
+    # Shamelessly LLM translated from https://github.com/JonathanHallstrom/pawnocchio/blob/pp/src/nnue/outputs/multilayer.zig#L41
+    # Seriously this is black magic shit
+    proc transform(net: var Network, l1wDisk: var L1WeightDisk, l2wDisk: var L2WeightDisk, l3wDisk: var L3WeightDisk) =
+        ## Transforms Bullet's disk weight layout into the layout used for inference.
+        for bucket in 0..<NUM_OUTPUT_BUCKETS:
+            for i in 0..<L1_SIZE div 4:
+                let src = (i div FT_GROUP_PERM.len) * FT_GROUP_PERM.len + FT_GROUP_PERM[i mod FT_GROUP_PERM.len]
+                for j in 0..<L2_SIZE:
+                    for k in 0..<4:
+                        net.l1.weight[bucket][i * 4 * L2_SIZE + j * 4 + k] = l1wDisk[src * 4 + k][bucket][j]
 
-    for bucket in 0..<NUM_OUTPUT_BUCKETS:
-        for i in 0..<L2_SIZE * (1 + DUAL_ACTIVATION.int):
-            for j in 0..<L3_SIZE:
-                net.l2.buckets[bucket].weight[i][j] = l2wDisk[i][bucket][j]
+        for bucket in 0..<NUM_OUTPUT_BUCKETS:
+            for i in 0..<L2_SIZE * (1 + DUAL_ACTIVATION.int):
+                for j in 0..<L3_SIZE:
+                    net.l2.buckets[bucket].weight[i][j] = l2wDisk[i][bucket][j]
 
-    for bucket in 0..<NUM_OUTPUT_BUCKETS:
-        for i in 0..<L3_SIZE:
-            net.l3.buckets[bucket].weight[i][0] = l3wDisk[i][bucket]
+        for bucket in 0..<NUM_OUTPUT_BUCKETS:
+            for i in 0..<L3_SIZE:
+                net.l3.buckets[bucket].weight[i][0] = l3wDisk[i][bucket]
+
+    func l1WeightIndex*(input, output: int): int {.inline.} =
+        ## Map a canonical activated FT input to the packed inference weight layout.
+        ## Scalar inference and file export must undo the SIMD packing permutation.
+        const inverse = block:
+            var order: array[FT_GROUP_PERM.len, int]
+            for i, source in FT_GROUP_PERM:
+                order[source] = i
+            order
+        let group = input div 4
+        let stored = (group div inverse.len) * inverse.len + inverse[group mod inverse.len]
+        return stored * 4 * L2_SIZE + output * 4 + input mod 4
 
 
 proc loadNet*(stream: Stream): Network =
@@ -170,44 +216,57 @@ proc loadNet*(stream: Stream): Network =
         for j in 0..<L1_SIZE:
             result.ft.weight[i][j] = stream.readLittleInt16()
 
+    for i in 0..<TOTAL_THREATS:
+        for j in 0..<L1_SIZE:
+            result.threatWeights[i][j] = stream.readInt8()
+
     for i in 0..<L1_SIZE:
         result.ft.bias[i] = stream.readLittleInt16()
 
-    # Note: we don't multiply by 2 like for single-layer nets: normally we
-    # would do that so we load in both perspective networks, but since we
-    # do pairwise multiplication (which halves the matmul size), that cancels
-    # it out
-    var l1wDisk {.noinit.}: L1WeightDisk
-    for i in 0..<L1_SIZE:
+    when SINGLE_LAYER:
         for bucket in 0..<NUM_OUTPUT_BUCKETS:
-            for j in 0..<L2_SIZE:
-                l1wDisk[i][bucket][j] = stream.readInt8()
-
-    for bucket in 0..<NUM_OUTPUT_BUCKETS:
-        for i in 0..<L2_SIZE:
-            result.l1.bias[bucket][i] = stream.readLittleInt32()
-
-    var l2wDisk {.noinit.}: L2WeightDisk
-    # If we do dual activation for the L2, we effectively
-    # have 2 of them
-    for i in 0..<(L2_SIZE * (1 + DUAL_ACTIVATION.int)):
+            for i in 0..<L1_SIZE * 2:
+                result.output.weight[bucket][i] = stream.readLittleInt16()
         for bucket in 0..<NUM_OUTPUT_BUCKETS:
-            for j in 0..<L3_SIZE:
-                l2wDisk[i][bucket][j] = stream.readLittleInt32()
+            result.output.bias[bucket] = stream.readLittleInt16()
+    else:
+        # Note: we don't multiply by 2 like for single-layer nets: normally we
+        # would do that so we load in both perspective networks, but since we
+        # do pairwise multiplication (which halves the matmul size), that cancels
+        # it out
+        var l1wDisk {.noinit.}: L1WeightDisk
+        for i in 0..<L1_SIZE:
+            for bucket in 0..<NUM_OUTPUT_BUCKETS:
+                for j in 0..<L2_SIZE:
+                    l1wDisk[i][bucket][j] = stream.readInt8()
 
-    for bucket in 0..<NUM_OUTPUT_BUCKETS:
+        for bucket in 0..<NUM_OUTPUT_BUCKETS:
+            for i in 0..<L2_SIZE:
+                # Some exporters add biases after requantization. Lifting those
+                # biases here keeps both inference backends in pre-shift space.
+                result.l1.bias[bucket][i] = stream.readLittleInt32() shl L1_BIAS_SHIFT
+
+        var l2wDisk {.noinit.}: L2WeightDisk
+        # If we do dual activation for the L2, we effectively
+        # have 2 of them
+        for i in 0..<(L2_SIZE * (1 + DUAL_ACTIVATION.int)):
+            for bucket in 0..<NUM_OUTPUT_BUCKETS:
+                for j in 0..<L3_SIZE:
+                    l2wDisk[i][bucket][j] = stream.readLittleInt32()
+
+        for bucket in 0..<NUM_OUTPUT_BUCKETS:
+            for i in 0..<L3_SIZE:
+                result.l2.buckets[bucket].bias[i] = stream.readLittleInt32()
+
+        var l3wDisk {.noinit.}: L3WeightDisk
         for i in 0..<L3_SIZE:
-            result.l2.buckets[bucket].bias[i] = stream.readLittleInt32()
+            for bucket in 0..<NUM_OUTPUT_BUCKETS:
+                l3wDisk[i][bucket] = stream.readLittleInt32()
 
-    var l3wDisk {.noinit.}: L3WeightDisk
-    for i in 0..<L3_SIZE:
         for bucket in 0..<NUM_OUTPUT_BUCKETS:
-            l3wDisk[i][bucket] = stream.readLittleInt32()
+            result.l3.buckets[bucket].bias[0] = stream.readLittleInt32()
 
-    for bucket in 0..<NUM_OUTPUT_BUCKETS:
-        result.l3.buckets[bucket].bias[0] = stream.readLittleInt32()
-
-    result.transform(l1wDisk, l2wDisk, l3wDisk)
+        result.transform(l1wDisk, l2wDisk, l3wDisk)
 
 
 proc dumpNet*(net: Network, path: string) =
@@ -216,34 +275,41 @@ proc dumpNet*(net: Network, path: string) =
 
     for i in 0..<FT_SIZE * NUM_INPUT_BUCKETS:
         for j in 0..<L1_SIZE:
-            file.writeData(addr net.ft.weight[i][j], sizeof(int16))
+            file.writeLittleInt16(net.ft.weight[i][j])
+
+    for i in 0..<TOTAL_THREATS:
+        file.writeData(addr net.threatWeights[i][0], L1_SIZE * sizeof(int8))
 
     for i in 0..<L1_SIZE:
-        file.writeData(addr net.ft.bias[i], sizeof(int16))
+        file.writeLittleInt16(net.ft.bias[i])
 
-    for bucket in 0..<NUM_OUTPUT_BUCKETS:
-        for i in 0..<L1_SIZE * L2_SIZE:
-            file.writeData(addr net.l1.weight[bucket][i], sizeof(int8))
-
-    for bucket in 0..<NUM_OUTPUT_BUCKETS:
-        for i in 0..<L2_SIZE:
-            file.writeData(addr net.l1.bias[bucket][i], sizeof(int8))
-
-    for bucket in 0..<NUM_OUTPUT_BUCKETS:
-        for i in 0..<(L2_SIZE * (1 + DUAL_ACTIVATION.int)):
-            for j in 0..<L3_SIZE:
-                file.writeData(addr net.l2.buckets[bucket].weight[i][j], sizeof(int32))
-
-    for bucket in 0..<NUM_OUTPUT_BUCKETS:
-        for i in 0..<L3_SIZE:
-            file.writeData(addr net.l2.buckets[bucket].bias[i], sizeof(int32))
-
-    for bucket in 0..<NUM_OUTPUT_BUCKETS:
-        for i in 0..<L3_SIZE:
-            file.writeData(addr net.l3.buckets[bucket].weight[i][0], sizeof(int32))
-
-    for bucket in 0..<NUM_OUTPUT_BUCKETS:
-        file.writeData(addr net.l3.buckets[bucket].bias[0], sizeof(int32))  
+    when SINGLE_LAYER:
+        for bucket in 0..<NUM_OUTPUT_BUCKETS:
+            for i in 0..<L1_SIZE * 2:
+                file.writeLittleInt16(net.output.weight[bucket][i])
+        for bucket in 0..<NUM_OUTPUT_BUCKETS:
+            file.writeLittleInt16(net.output.bias[bucket])
+    else:
+        # Write the canonical disk layout, undoing the runtime permutation.
+        for input in 0..<L1_SIZE:
+            for bucket in 0..<NUM_OUTPUT_BUCKETS:
+                for output in 0..<L2_SIZE:
+                    file.write(net.l1.weight[bucket][l1WeightIndex(input, output)])
+        for bucket in 0..<NUM_OUTPUT_BUCKETS:
+            for output in 0..<L2_SIZE:
+                file.writeLittleInt32(net.l1.bias[bucket][output] shr L1_BIAS_SHIFT)
+        for input in 0..<(L2_SIZE * (1 + DUAL_ACTIVATION.int)):
+            for bucket in 0..<NUM_OUTPUT_BUCKETS:
+                for output in 0..<L3_SIZE:
+                    file.writeLittleInt32(net.l2.buckets[bucket].weight[input][output])
+        for bucket in 0..<NUM_OUTPUT_BUCKETS:
+            for output in 0..<L3_SIZE:
+                file.writeLittleInt32(net.l2.buckets[bucket].bias[output])
+        for input in 0..<L3_SIZE:
+            for bucket in 0..<NUM_OUTPUT_BUCKETS:
+                file.writeLittleInt32(net.l3.buckets[bucket].weight[input][0])
+        for bucket in 0..<NUM_OUTPUT_BUCKETS:
+            file.writeLittleInt32(net.l3.buckets[bucket].bias[0])
 
 
 proc loadNet*(path: string): Network =
@@ -259,18 +325,18 @@ proc dumpVerbatimNet*(path: string, network: Network) =
     doAssert f.writeBuffer(network.addr, sizeof(network)) == sizeof(network)
 
 
-func initAccumulator*[I, O: static[int]](layer: Int16Layer[I, O], output: var array[O, int16]) {.inline.} =
+func initAccumulator*[I, O: static[int]](layer: Int16Layer[I, O], output: var array[O, int16]) {.inline, simdKernel.} =
     ## Initializes the given output array with
     ## the layer's biases
     output = layer.bias
 
 
-proc addFeature*[I, O: static[int]](layer: Int16Layer[I, O], index: int, output: var array[O, int16]) {.inline.} =
+proc addFeature*[I, O: static[int]](layer: Int16Layer[I, O], index: int, output: var array[O, int16]) {.inline, simdKernel.} =
     ## Adds the feature at the given index to the given
     ## output array
     when not defined(simd):
         for o in 0..<O:
-            output[o] += layer.weight[index][o]
+            output[o] = output[o] +% (layer.weight[index][o])
     else:
         var o = 0
         while o < O:
@@ -281,12 +347,12 @@ proc addFeature*[I, O: static[int]](layer: Int16Layer[I, O], index: int, output:
             o += CHUNK_SIZE
 
 
-proc removeFeature*[I, O: static[int]](layer: Int16Layer[I, O], index: int, output: var array[O, int16]) {.inline.} =
+proc removeFeature*[I, O: static[int]](layer: Int16Layer[I, O], index: int, output: var array[O, int16]) {.inline, simdKernel.} =
     ## Removes the feature at the given index from the given
     ## output array
     when not defined(simd):
         for o in 0..<O:
-            output[o] -= layer.weight[index][o]
+            output[o] = output[o] -% (layer.weight[index][o])
     else:
         var o = 0
         while o < O:
@@ -298,29 +364,39 @@ proc removeFeature*[I, O: static[int]](layer: Int16Layer[I, O], index: int, outp
 
 
 
-proc addSub[I, O: static[int]](layer: Int16Layer[I, O], i0, i1: int, previous, current: var array[O, int16]) {.inline.} =
+proc addSub*[I, O: static[int]](layer: Int16Layer[I, O], i0, i1: int, previous, current: var array[O, int16]) {.inline, simdKernel.} =
     ## Equivalent to two calls to add/remove feature with i0 and i1
     ## as indeces
     when not defined(simd):
         for i in 0..<O:
-            current[i] = previous[i] + layer.weight[i0][i] - layer.weight[i1][i]
+            current[i] = previous[i] +% layer.weight[i0][i] -% layer.weight[i1][i]
     else:
-        var i = 0
-        while i < O:
+        template applyChunk(i: int) =
             let a = vecLoad(addr layer.weight[i0][i])
             let b = vecLoad(addr layer.weight[i1][i])
             let prev = vecLoad(addr previous[i])
             let result = vecSub16(vecAdd16(prev, a), b)
             vecStore(addr current[i], result)
+        var i = 0
+        # Amortize loop overhead across four SIMD registers.
+        when defined(sse2) or defined(avx2) or defined(neon):
+            while i + 4 * CHUNK_SIZE <= O:
+                applyChunk(i)
+                applyChunk(i + CHUNK_SIZE)
+                applyChunk(i + 2 * CHUNK_SIZE)
+                applyChunk(i + 3 * CHUNK_SIZE)
+                i += 4 * CHUNK_SIZE
+        while i < O:
+            applyChunk(i)
             i += CHUNK_SIZE
 
 
-proc addSubAddSub*[I, O: static[int]](layer: Int16Layer[I, O], i0, i1, i2, i3: int, previous, current: var array[O, int16]) {.inline.} =
+proc addSubAddSub*[I, O: static[int]](layer: Int16Layer[I, O], i0, i1, i2, i3: int, previous, current: var array[O, int16]) {.inline, simdKernel.} =
     ## Equivalent to two calls to addSub with i0, i1, i2 and
     ## i3 as indeces
     when not defined(simd):
         for i in 0..<O:
-            current[i] = previous[i] + layer.weight[i0][i] - layer.weight[i1][i] + layer.weight[i2][i] - layer.weight[i3][i]
+            current[i] = previous[i] +% layer.weight[i0][i] -% layer.weight[i1][i] +% layer.weight[i2][i] -% layer.weight[i3][i]
     else:
         var i = 0
         while i < O:
@@ -335,10 +411,10 @@ proc addSubAddSub*[I, O: static[int]](layer: Int16Layer[I, O], i0, i1, i2, i3: i
 
 # Helpers to speed up finny table updates, equivalent to 4 calls to add/remove feature
 
-proc quadAdd*[I, O: static[int]](layer: Int16Layer[I, O], i0, i1, i2, i3: int, current: var array[O, int16]) {.inline.} =
+proc quadAdd*[I, O: static[int]](layer: Int16Layer[I, O], i0, i1, i2, i3: int, current: var array[O, int16]) {.inline, simdKernel.} =
     when not defined(simd):
         for i in 0..<O:
-            current[i] += layer.weight[i0][i] + layer.weight[i1][i] + layer.weight[i2][i] + layer.weight[i3][i]
+            current[i] = current[i] +% (layer.weight[i0][i] +% layer.weight[i1][i] +% layer.weight[i2][i] +% layer.weight[i3][i])
     else:
         var i = 0
         while i < O:
@@ -352,10 +428,10 @@ proc quadAdd*[I, O: static[int]](layer: Int16Layer[I, O], i0, i1, i2, i3: int, c
             i += CHUNK_SIZE
 
 
-proc quadSub*[I, O: static[int]](layer: Int16Layer[I, O], i0, i1, i2, i3: int, current: var array[O, int16]) {.inline.} =
+proc quadSub*[I, O: static[int]](layer: Int16Layer[I, O], i0, i1, i2, i3: int, current: var array[O, int16]) {.inline, simdKernel.} =
     when not defined(simd):
         for i in 0..<O:
-            current[i] -= layer.weight[i0][i] + layer.weight[i1][i] + layer.weight[i2][i] + layer.weight[i3][i]
+            current[i] = current[i] -% (layer.weight[i0][i] +% layer.weight[i1][i] +% layer.weight[i2][i] +% layer.weight[i3][i])
     else:
         var i = 0
         while i < O:
@@ -369,22 +445,32 @@ proc quadSub*[I, O: static[int]](layer: Int16Layer[I, O], i0, i1, i2, i3: int, c
             i += CHUNK_SIZE
 
 
-proc addSubSub[I, O: static[int]](layer: Int16Layer[I, O], i0, i1, i2: int, previous, current: var array[O, int16]) {.inline.} =
+proc addSubSub*[I, O: static[int]](layer: Int16Layer[I, O], i0, i1, i2: int, previous, current: var array[O, int16]) {.inline, simdKernel.} =
     ## Equivalent to three calls to add/add/remove feature with i0, i1
     ## and i2 as indeces
     when not defined(simd):
         for i in 0..<O:
-            current[i] = previous[i] + layer.weight[i0][i] - layer.weight[i1][i] - layer.weight[i2 ][i]
+            current[i] = previous[i] +% layer.weight[i0][i] -% layer.weight[i1][i] -% layer.weight[i2 ][i]
     else:
-        var i = 0
-        while i < O:
+        template applyChunk(i: int) =
             let a = vecLoad(addr layer.weight[i0][i])
             let b = vecLoad(addr layer.weight[i1][i])
             let c = vecLoad(addr layer.weight[i2][i])
             let prev = vecLoad(addr previous[i])
             let result = vecSub16(vecSub16(vecAdd16(prev, a), b), c)
             vecStore(addr current[i], result)
+        var i = 0
+        when defined(sse2) or defined(avx2) or defined(neon):
+            while i + 4 * CHUNK_SIZE <= O:
+                applyChunk(i)
+                applyChunk(i + CHUNK_SIZE)
+                applyChunk(i + 2 * CHUNK_SIZE)
+                applyChunk(i + 3 * CHUNK_SIZE)
+                i += 4 * CHUNK_SIZE
+        while i < O:
+            applyChunk(i)
             i += CHUNK_SIZE
+
 
 
 func addSub*(self: var UpdateQueue, i0, i1: int) {.inline.} =

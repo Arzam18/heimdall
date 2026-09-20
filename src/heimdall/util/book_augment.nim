@@ -1,8 +1,19 @@
+# Copyright 2026 Mattia Giambirtone & All Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import heimdall/[eval, board, moves, search, movegen, position, transpositions]
 import heimdall/util/[wdl, limits, tunables]
-import heimdall/util/memory/aligned
-
-
 import std/[sets, math, times, strformat, atomics, random, terminal, os, strutils]
 
 
@@ -32,13 +43,12 @@ proc formatDuration(seconds: float): string =
 proc workerProc(args: WArg) {.thread.} =
     var
         picker = initRand(args.seed + args.workerID)
-        transpositionTable = allocHeapAligned(TranspositionTable, 64)
+        transpositionTable = newTranspositionTable(args.searcherConfig.hash * 1024 * 1024)
         parameters = getDefaultParameters()
     # We clear the whole table between every position to keep evals clean (the TT has
     # no aging yet), so its size directly drives the per-position zeroing cost. A
     # node-capped, shallow search only ever touches a handful of entries, so the hash
     # default is kept small (1 MiB) since a larger table would just be wasted zeroing.
-    transpositionTable[] = newTranspositionTable(args.searcherConfig.hash * 1024 * 1024)
     var searcher = newSearchManager(@[startpos()], transpositionTable, parameters, evalState=newEvalState(verbose=false))
 
     searcher.limiter.addLimit(newDepthLimit(args.searcherConfig.depth))

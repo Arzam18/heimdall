@@ -16,8 +16,7 @@
 
 import heimdall/[board, search, movegen, transpositions, pieces as pcs, eval, nnue]
 import heimdall/util/[perft, tunables, help, wdl, eval_stats, logs]
-import heimdall/util/memory/aligned
-
+from heimdall/util/shared import MAX_DEPTH, DEFAULT_PRETTY_PV_LENGTH
 import std/[os, math, times, atomics, options, terminal, strutils, strformat,
             sequtils, parseutils, exitprocs]
 from std/lenientops import `/`
@@ -43,13 +42,20 @@ proc runPolicyEval(session: UCISession, evalState: EvalState, useColor: bool) =
     var
         bestMove = nullMove()
         bestScore = lowestEval()
+    evalState.init(session.board)
     for move in moves:
-        session.board.makeMove(move)
-        evalState.init(session.board)  # Slow, but this is simple and correct
+        let
+            sideToMove = session.board.sideToMove
+            piece = session.board.on(move.startSquare).kind
+            captured = session.board.on(move.captureSquare()).kind
+            kingSq = session.board.position.kingSquare(sideToMove)
+        evalState.update(move, sideToMove, piece, captured, kingSq)
+        session.board.doMove(move)
         # The eval is from the side-to-move's perspective: after our move
         # it's the opponent's turn, so we negate to get our own score
         let ourScore = -session.board.evaluate(evalState)
         session.board.unmakeMove()
+        evalState.undo()
         if bestMove == nullMove() or ourScore > bestScore:
             bestScore = ourScore
             bestMove = move
@@ -74,7 +80,7 @@ proc startUCISession* =
         cmd: UCICommand
         cmdStr: string
         session = UCISession(hashTableSize: 64, board: newDefaultChessboard(), variations: 1, overhead: 250, isMixedMode: true)
-        transpositionTable = allocHeapAligned(TranspositionTable, 64)
+        transpositionTable = newTranspositionTable(session.hashTableSize * 1024 * 1024, session.workers + 1)
         searchWorker = session.createSearchWorker()
         # Used for the StaticEval command so we don't mess with the eval
         # state of the searcher. The owner keeps the huge-page-backed state
@@ -85,8 +91,6 @@ proc startUCISession* =
 
     # Start search worker
     createThread(searchWorkerThread, searchWorkerLoop, searchWorker)
-    transpositionTable[] = newTranspositionTable(session.hashTableSize * 1024 * 1024, session.workers + 1)
-    transpositionTable.init(session.workers + 1)
     session.searcher = newSearchManager(session.board.positions, transpositionTable)
 
     let
@@ -220,6 +224,7 @@ proc startUCISession* =
                     echo "option name RandomizeSoftLimit type check default false"
                     echo "option name Contempt type spin default 0 min 0 max 3000"
                     echo "option name Hash type spin default 64 min 1 max 33554432"
+                    echo &"option name PrettyPVLength type spin default {DEFAULT_PRETTY_PV_LENGTH} min 0 max {MAX_DEPTH}"
                     echo "option name MoveOverhead type spin default 250 min 0 max 30000"
                     echo "option name HardNodeLimit type spin default 1000000 min 0 max 4294967296"
                     echo "option name SoftNodeRandomLimit type spin default 0 min 0 max 4294967296"
@@ -229,6 +234,15 @@ proc startUCISession* =
                     echo "uciok"
                     session.searcher.setUCIMode(true)
                     session.isMixedMode = false
+                of Register:
+                    if session.isMixedMode:
+                        stderr.styledWrite(useColor, fgRed, styleBright, "Error: registration is unavailable in mixed mode; send uci first\n")
+                        continue
+                    # We don't support/require registration, but I gotta scratch the "full UCI support" itch. Or maybe I should just shower.
+                    # ...
+                    # ...
+                    # Nah.
+                    echo "registration checking\nregistration ok"
                 of Simple:
                     if not session.isMixedMode:
                         echo "info string this command is disabled while in UCI mode, send icu to revert to mixed mode"
@@ -381,7 +395,7 @@ proc startUCISession* =
                             else:
                                 stdout.styledWrite(useColor, styleBright, fgWhite, "in progress", resetStyle, "\n")
                         of Threats:
-                            stdout.styledWrite(useColor, fgGreen, "Squares threathened by ", styleBright, fgWhite, ($session.board.sideToMove.opposite()).toLowerAscii(), resetStyle, fgGreen, " in the current position:\n", styleBright, fgWhite, $session.board.position.threats, resetStyle, "\n")
+                            stdout.styledWrite(useColor, fgGreen, "Squares threathened by ", styleBright, fgWhite, ($session.board.sideToMove.opposite()).toLowerAscii(), resetStyle, fgGreen, " in the current position:\n", styleBright, fgWhite, $session.board.threats(), resetStyle, "\n")
                         of Material:
                             stdout.styledWrite(useColor, fgGreen, "Material currently on the board: ", styleBright, fgWhite, $session.board.material(), resetStyle, fgGreen, " points\n")
                         of InputBucket:
@@ -495,6 +509,28 @@ proc startUCISession* =
                             else:
                                 stdout.styledWrite(useColor, fgYellow, "Warning: position is in terminal state (checkmate or draw)\n")
                             continue
+                        # Reject unsupported requests before marking the asynchronous
+                        # worker busy: a rejected request never enters search(), so it
+                        # cannot clear the busy flag or send SearchComplete to stop/wait.
+                        let
+                            timeRemaining = if session.board.sideToMove == White: cmd.wtime else: cmd.btime
+                            increment = if session.board.sideToMove == White: cmd.winc else: cmd.binc
+                        var rejection = ""
+                        if not session.enableWeirdTCs:
+                            if cmd.moveTime.isNone() and timeRemaining.isSome() and (increment.isNone() or increment.get() == 0):
+                                rejection = NO_INCREMENT_TC_DETECTED
+                            elif cmd.movesToGo.isSome() and cmd.movesToGo.get() != 0:
+                                rejection = CYCLIC_TC_DETECTED
+                        if rejection.len() == 0 and cmd.ponder and not session.canPonder:
+                            rejection = PONDER_OPT_REQUIRED
+                        if rejection.len() > 0:
+                            session.isInfiniteSearch = false
+                            if session.isMixedMode:
+                                stderr.styledWrite(useColor, fgRed, "Error: ", fgYellow, rejection, "\n")
+                            else:
+                                stderr.writeLine(&"info string {rejection}")
+                                echo "bestmove 0000"
+                            continue
                         # Start the clock as soon as possible to account
                         # for startup delays in our time management
                         session.searcher.startClock()
@@ -571,7 +607,7 @@ proc startUCISession* =
                             else:
                                 newSize = value.parseBiggestUInt()
                             doAssert newSize in 1'u64..33554432'u64
-                            if newSize != transpositionTable.size:
+                            if newSize != session.hashTableSize:
                                 if session.debug:
                                     echo &"info string resizing TT from {session.hashTableSize} MiB To {newSize} MiB"
                                 if transpositionTable.resize(newSize * 1048576, session.workers + 1):
@@ -630,6 +666,12 @@ proc startUCISession* =
                             session.searcher.state.normalizeScore.store(enabled, moRelaxed)
                             if session.debug:
                                 echo &"info string normalizing displayed scores: {enabled}"
+                        of "prettypvlength":
+                            let length = value.parseInt()
+                            doAssert length in 0..MAX_DEPTH
+                            session.searcher.state.prettyPVLength.store(length, moRelaxed)
+                            if session.debug:
+                                echo &"info string pretty PV length: {length}"
                         of "uci_showwdl":
                             doAssert value in ["true", "false"]
                             let enabled = value == "true"

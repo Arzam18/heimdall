@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Authored with assistance from AI agents.
 
 ## Central application state for the TUI
 
@@ -347,7 +349,7 @@ type
 
     WatchEngineState* = object
         searcher*: SearchManager
-        ttable*: ptr TranspositionTable
+        ttable*: TranspositionTable
         threads*: int
         hash*: uint64
         allowPonder*: bool
@@ -434,7 +436,7 @@ type
 
         # Search integration
         searcher*: SearchManager
-        ttable*: ptr TranspositionTable
+        ttable*: TranspositionTable
         searchWorkerThread*: Thread[ptr AppState]
         channels*: tuple[command: Channel[SearchCommand], response: Channel[SearchResponse]]
         pvChannel*: Channel[seq[AnalysisLine]]
@@ -483,8 +485,7 @@ proc newAppState*: AppState =
     result.play.sideSelection = SideRandom
     result.play.watch.hash = 64
     result.play.watch.threads = 1
-    result.ttable = create(TranspositionTable)
-    result.ttable[] = newTranspositionTable(result.engineHash * 1024 * 1024, result.engineThreads)
+    result.ttable = newTranspositionTable(result.engineHash * 1024 * 1024, result.engineThreads)
     result.searcher = newSearchManager(result.board.positions, result.ttable, evalState=newEvalState(verbose=false))
     result.channels.command.open()
     result.channels.response.open()
@@ -1248,7 +1249,4 @@ proc cleanup*(state: AppState) =
     state.channels.response.close()
     state.pvChannel.close()
     state.gameAnalysisChannel.close()
-    if state.ttable != nil:
-        state.ttable.destroy()
-        dealloc(state.ttable)
-        state.ttable = nil
+    state.ttable = nil

@@ -159,7 +159,7 @@ proc fromMarlinformat*(data: string): MarlinFormatRecord =
     inc(i, 8)
 
     result = MarlinFormatRecord()
-    for sq in Square.all():
+    for sq in Square.items():
         result.position.mailbox[sq] = nullPiece()
     for color in White..Black:
         result.position.castlingAvailability[color] = (nullSquare(), nullSquare())
@@ -185,7 +185,7 @@ proc fromMarlinformat*(data: string): MarlinFormatRecord =
                 result.position.castlingAvailability[color].king = sq
             else:
                 result.position.castlingAvailability[color].queen = sq
-        result.position.spawn(sq, Piece(kind: PieceKind(pieceNum), color: color))
+        result.position.spawn(sq, createPiece(kind=PieceKind(pieceNum), color=color))
 
 
     let stmAndEpSquare = meta[0].getChar().uint8

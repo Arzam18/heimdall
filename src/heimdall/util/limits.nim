@@ -37,6 +37,7 @@ type
     SearchLimiter* = object
         enabled: bool
         hardLimitReached: bool
+        hardLimitKinds: set[LimitKind]
         startTimeOverride: Option[MonoTime]
         limits: seq[SearchLimit]
         searchState: SearchState
@@ -115,17 +116,19 @@ proc newMateLimit*(moves: int): SearchLimit =
 
 proc addLimit*(self: var SearchLimiter, limit: SearchLimit) =
     self.limits.add(limit)
+    self.hardLimitKinds.incl(limit.kind)
 
 
 proc clear*(self: var SearchLimiter) =
     self.limits = @[]
     self.hardLimitReached = false
+    self.hardLimitKinds = {}
     self.startTimeOverride = none(MonoTime)
 
 
 proc elapsedMsec(startTime: MonoTime): int64 {.inline.} = (getMonoTime() - startTime).inMilliseconds()
 
-proc elapsedMsec(self: SearchLimiter): uint64 {.inline.} =
+proc elapsedMsec*(self: SearchLimiter): uint64 {.inline.} =
     if self.startTimeOverride.isNone():
         return self.searchState.searchStart.load(moRelaxed).elapsedMsec().uint64
     else:
@@ -147,8 +150,9 @@ proc expiredSoft(self: SearchLimit, limiter: SearchLimiter): bool {.inline.} =
             if bestScore.isMateScore():
                 return bestScore >= mateIn(self.lowerBound.int * 2)
         of Depth:
-            # No soft limit for depth
-            return false
+            # Called between complete iterative-deepening iterations, after all
+            # requested MultiPV lines have finished at this depth.
+            return limiter.searchStats.highestDepth.load(moRelaxed).uint64 >= self.lowerBound
         of Nodes:
             return self.lowerBound > 0 and limiter.totalNodes() >= self.lowerBound
         of Time:
@@ -169,9 +173,10 @@ proc expiredHard*(self: SearchLimit, limiter: var SearchLimiter): bool {.inline.
             # is sound
             limiter.hardLimitReached = false
         of Depth:
-            # Annoying fix: if we set hardLimitReached, searches for "go depth x" will
-            # print a duplicate log line with d=n and sd=0
-            return limiter.searchStats.highestDepth.load().uint64 >= self.upperBound
+            # highestDepth is published after each variation. Treating it as a
+            # hard cutoff interrupts the remaining MultiPV lines, including
+            # when depth is combined with node/time limits.
+            return false
         of Nodes:
             limiter.hardLimitReached = limiter.totalNodes() >= self.upperBound
         of Time:
@@ -187,6 +192,15 @@ proc expiredHard*(self: var SearchLimiter): bool {.inline.} =
         return false
     if self.hardLimitReached:
         return true
+    # Depth/mate limits only end whole iterations. Time-only searches sample
+    # the clock every 1024 nodes; avoid walking the list between those samples.
+    if Nodes notin self.hardLimitKinds:
+        if Time notin self.hardLimitKinds:
+            return false
+        if not self.searchState.isMainThread.load(moRelaxed) or
+           self.searchState.pondering.load(moRelaxed) or
+           self.searchStats.nodeCount.load(moRelaxed) mod 1024 != 0:
+            return false
     for limit in self.limits:
         if limit.expiredHard(self):
             return true

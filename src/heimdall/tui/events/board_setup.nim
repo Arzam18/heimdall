@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Authored with assistance from AI agents.
 
 ## Board setup mode state transitions and input handling.
 
@@ -53,7 +55,7 @@ proc setupSpawnPieceForKey(key: Key): Option[Piece] =
         else:
             return none(Piece)
 
-    some(Piece(kind: kind, color: color))
+    some(createPiece(kind=kind, color=color))
 
 
 proc validateBoardSetupPosition(state: AppState): tuple[ok: bool, error: string] =

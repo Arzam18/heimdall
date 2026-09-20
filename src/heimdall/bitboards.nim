@@ -14,7 +14,7 @@
 
 ## Implements low-level bit operations
 
-import std/[sugar, bitops, strutils]
+import std/[bitops, strutils]
 
 import heimdall/[moves, pieces]
 
@@ -33,6 +33,13 @@ type
         ForwardRight,
         BackwardLeft,
         BackwardRight
+
+
+{.push.}
+# Nim is big stupid and we need operators that work on more than
+# just the type itself.
+when (NimMajor, NimMinor, NimPatch) >= (2, 2, 12):
+    {.warning[InvalidCmpOp]:off.}
 
 func `shl`*(a: Bitboard, x: Natural): Bitboard {.borrow, inline.}
 func `shr`*(a: Bitboard, x: Natural): Bitboard {.borrow, inline.}
@@ -72,6 +79,8 @@ func rankMask*(rank: Rank): Bitboard            {.inline.} = Bitboard(0xff) shl 
 func toBitboard*(square: SomeInteger): Bitboard {.inline.} = Bitboard(1'u64) shl square
 func toBitboard*(square: Square): Bitboard      {.inline.} = square.int8.toBitboard()
 func toSquare*(b: Bitboard): Square             {.inline.} = Square(b.countTrailingZeroBits())
+
+{.pop.}
 
 func lowestBit*(self: Bitboard): Bitboard {.inline.} =
     {.push overflowChecks:off.}
@@ -147,31 +156,30 @@ func pretty*(self: Bitboard): string =
 
 func `$`*(self: Bitboard): string {.inline.} = self.pretty()
 
-func generateShifters: array[White..Black, array[Direction, (Bitboard {.noSideEffect.} -> Bitboard)]] {.compileTime.} =
-    result[White][Forward]       = (x: Bitboard) => x shr 8
-    result[White][Backward]      = (x: Bitboard) => x shl 8
-    result[White][Left]          = (x: Bitboard) => x shr 1
-    result[White][Right]         = (x: Bitboard) => x shl 1
-    result[White][ForwardRight]  = (x: Bitboard) => x shr 7
-    result[White][ForwardLeft]   = (x: Bitboard) => x shr 9
-    result[White][BackwardRight] = (x: Bitboard) => x shl 9
-    result[White][BackwardLeft]  = (x: Bitboard) => x shl 7
-
-    result[Black][Backward]      = (x: Bitboard) => x shr 8
-    result[Black][Forward]       = (x: Bitboard) => x shl 8
-    result[Black][Right]         = (x: Bitboard) => x shr 1
-    result[Black][Left]          = (x: Bitboard) => x shl 1
-    result[Black][BackwardLeft]  = (x: Bitboard) => x shr 7
-    result[Black][BackwardRight] = (x: Bitboard) => x shr 9
-    result[Black][ForwardLeft]   = (x: Bitboard) => x shl 9
-    result[Black][ForwardRight]  = (x: Bitboard) => x shl 7
-
-
-const shifters: array[White..Black, array[Direction, (Bitboard) {.noSideEffect.} -> Bitboard]] = generateShifters()
-
-
 func directionMask*(bitboard: Bitboard, color: PieceColor, direction: Direction): Bitboard {.inline.} =
-    shifters[color][direction](bitboard)
+    case color:
+        of White:
+            case direction:
+                of Forward:       result = bitboard shr 8
+                of Backward:      result = bitboard shl 8
+                of Left:          result = bitboard shr 1
+                of Right:         result = bitboard shl 1
+                of ForwardRight:  result = bitboard shr 7
+                of ForwardLeft:   result = bitboard shr 9
+                of BackwardRight: result = bitboard shl 9
+                of BackwardLeft:  result = bitboard shl 7
+        of Black:
+            case direction:
+                of Forward:       result = bitboard shl 8
+                of Backward:      result = bitboard shr 8
+                of Left:          result = bitboard shl 1
+                of Right:         result = bitboard shr 1
+                of ForwardRight:  result = bitboard shl 7
+                of ForwardLeft:   result = bitboard shl 9
+                of BackwardRight: result = bitboard shr 9
+                of BackwardLeft:  result = bitboard shr 7
+        of None:
+            result = Bitboard(0)
 
 func directionMask*(square: Square, color: PieceColor, direction: Direction): Bitboard {.inline.} =
     directionMask(square.toBitboard(), color, direction)
@@ -238,7 +246,7 @@ func shortKnightDownRight*(self: Bitboard, side: PieceColor): Bitboard {.inline.
 # We precompute as much stuff as possible: lookup tables are fast!
 
 func computeKingBitboards: array[Square.smallest()..Square.biggest(), Bitboard] {.compileTime.} =
-    for i in Square.all():
+    for i in Square.items():
         let king = i.toBitboard()
         # It doesn't really matter which side we generate
         # the move for, they're identical for both
@@ -259,7 +267,7 @@ func computeKingBitboards: array[Square.smallest()..Square.biggest(), Bitboard] 
 
 
 func computeKnightBitboards: array[Square.smallest()..Square.biggest(), Bitboard] {.compileTime.} =
-    for i in Square.all():
+    for i in Square.items():
         let knight = i.toBitboard()
         # It doesn't really matter which side we generate
         # the move for, they're identical for both
@@ -276,12 +284,12 @@ func computeKnightBitboards: array[Square.smallest()..Square.biggest(), Bitboard
 
 
 func computePawnAttackers(color: PieceColor): array[Square.smallest()..Square.biggest(), Bitboard] {.compileTime.} =
-    for i in Square.all():
+    for i in Square.items():
         let pawn = i.toBitboard()
         result[i] = pawn.backwardLeft(color) or pawn.backwardRight(color)
 
 func computePawnAttacks(color: PieceColor): array[Square.smallest()..Square.biggest(), Bitboard] {.compileTime.} =
-    for i in Square.all():
+    for i in Square.items():
         let pawn = i.toBitboard()
         result[i] = pawn.forwardLeft(color) or pawn.forwardRight(color)
 

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import std/[strformat, strutils]
+import std/[strformat, strutils, typetraits]
 
 import heimdall/[bitboards, moves, pieces as pcs]
 import heimdall/util/[magics, rays, zobrist]
@@ -64,11 +64,16 @@ type
         mailbox*: array[Square.smallest()..Square.biggest(), Piece]
         # Does this position come from a null move?
         fromNull*: bool
-        # Squares attacked by the non-side-to-move
-        threats*: Bitboard
+        # Cached squares attacked by the non-side-to-move. An empty bitboard
+        # marks the cache as invalid; every valid position has an enemy king,
+        # so a computed threat map can never be empty.
+        threatsCache: Bitboard
 
 
-proc `=copy`(dest: var Position, source: Position)  {.error: "use clone() to explicitly copy Position objects!".}
+static:
+    # Move generation copies stack entries as raw memory. Keep Position a plain
+    # value; custom copy hooks also make seq shrinking reset every removed entry.
+    doAssert supportsCopyMem(Position), "Position must support raw stack copies"
 
 proc clone*(pos: Position): Position =
   for fieldA, fieldB in fields(pos, result):
@@ -101,6 +106,25 @@ func material*(self: Position): int {.inline.} =
            self.pieces(Knight).count() * 3 +
            self.pieces(Rook).count() * 5 +
            self.pieces(Queen).count() * 9
+
+
+proc threatAttacks*(piece: Piece, square: Square, occupancy: Bitboard): Bitboard {.inline.} =
+    ## Returns attacked squares in board coordinates, including empty squares
+    ## and the first blocker on each sliding ray. Kings and empty pieces return
+    ## an empty bitboard. Intersect with occupancy to select occupied targets.
+    case piece.kind:
+        of Pawn:
+            result = pawnAttacks(piece.color, square)
+        of Knight:
+            result = knightMoves(square)
+        of Bishop:
+            result = bishopMoves(square, occupancy)
+        of Rook:
+            result = rookMoves(square, occupancy)
+        of Queen:
+            result = bishopMoves(square, occupancy) or rookMoves(square, occupancy)
+        of King, Empty:
+            result = Bitboard(0)
 
 
 proc pawnAttackers*(self: Position, square: Square, attackingSide: PieceColor): Bitboard {.inline.} =
@@ -136,8 +160,8 @@ proc slidingAttackers*(self: Position, square: Square, attackingSide: PieceColor
         rooks = self.pieces(Rook, attackingSide) or queens
         bishops = self.pieces(Bishop, attackingSide) or queens
 
-    result = bishopMoves(square, occupancy) and (bishops or queens)
-    result = result or rookMoves(square, occupancy) and (rooks or queens)
+    result = bishopMoves(square, occupancy) and bishops
+    result = result or rookMoves(square, occupancy) and rooks
 
 
 proc attackers*(self: Position, square: Square, attackingSide: PieceColor): Bitboard {.inline.} =
@@ -299,24 +323,28 @@ proc canCastle*(self: Position): tuple[queen, king: Square] {.inline.} =
     let
         sideToMove = self.sideToMove
         kingSq     = self.kingSquare(sideToMove)
-        king       = self.on(kingSq)
         occupancy  = self.pieces()
+        homeRank   = relativeRank(sideToMove, Rank(0))
+        shortKingTarget = makeSquare(homeRank, pcs.File(6))
+        shortRookTarget = makeSquare(homeRank, pcs.File(5))
+        longKingTarget = makeSquare(homeRank, pcs.File(2))
+        longRookTarget = makeSquare(homeRank, pcs.File(3))
 
     result = self.castlingAvailability[sideToMove]
 
     if result.king != nullSquare():
-        let rook = self.on(result.king)
         # Mask off the rook we're castling with from the occupancy, as
         # it does not actually prevent castling. The majority of these
         # extra checks are necessary to support the extended castling
         # rules of chess960
         let
             occupancy = occupancy and not result.king.toBitboard() and not kingSq.toBitboard()
-            target    = king.shortCastling().toBitboard()
-            kingRay   = rayBetween(result.king, king.shortCastling()) or king.shortCastling().toBitboard()
-            rookRay   = rayBetween(result.king, rook.shortCastling()) or rook.shortCastling().toBitboard()
+            target = shortKingTarget.toBitboard()
+            clearance = rayBetween(result.king, kingSq) or
+                        rayBetween(result.king, shortKingTarget) or target or
+                        rayBetween(result.king, shortRookTarget) or shortRookTarget.toBitboard()
 
-        if (rayBetween(result.king, kingSq) and occupancy).isEmpty() and (kingRay and occupancy).isEmpty() and (rookRay and occupancy).isEmpty():
+        if (clearance and occupancy).isEmpty():
             # There are no pieces in between our friendly king and
             # rook and between the friendly king/rook and their respective
             # destinations: now we check for attacks on the squares where
@@ -334,13 +362,13 @@ proc canCastle*(self: Position): tuple[queen, king: Square] {.inline.} =
 
     if result.queen != nullSquare():
         let
-            rook      = self.on(result.queen)
             occupancy = occupancy and not result.queen.toBitboard() and not kingSq.toBitboard()
-            target    = king.longCastling().toBitboard()
-            kingRay   = rayBetween(result.queen, king.longCastling()) or king.longCastling().toBitboard()
-            rookRay   = rayBetween(result.queen, rook.longCastling()) or rook.longCastling().toBitboard()
+            target = longKingTarget.toBitboard()
+            clearance = rayBetween(result.queen, kingSq) or
+                        rayBetween(result.queen, longKingTarget) or target or
+                        rayBetween(result.queen, longRookTarget) or longRookTarget.toBitboard()
 
-        if (rayBetween(result.queen, kingSq) and occupancy).isEmpty() and (kingRay and occupancy).isEmpty() and (rookRay and occupancy).isEmpty():
+        if (clearance and occupancy).isEmpty():
             for square in self.longCastleRay(sideToMove) or target:
                 if self.isAttacked(square, occupancy):
                     result.queen = nullSquare()
@@ -419,6 +447,7 @@ proc updateChecksAndPins*(self: var Position) {.inline.} =
     self.checkers = self.attackers(friendlyKing, nonSideToMove)
     self.diagonalPins = Bitboard(0)
     self.orthogonalPins = Bitboard(0)
+    self.threatsCache = Bitboard(0)
 
     let
         diagonalAttackers = self.pieces(Queen, nonSideToMove) or self.pieces(Bishop, nonSideToMove)
@@ -438,25 +467,32 @@ proc updateChecksAndPins*(self: var Position) {.inline.} =
         if (pinningRay and friendlyPieces).count() == 1:
             self.orthogonalPins = self.orthogonalPins or pinningRay
 
-    self.threats = Bitboard(0)
-    let occupancy = friendlyPieces or enemyPieces
-    for square in enemyPieces:
-        let piece = self.on(square)
-        case piece.kind:
-            of Pawn:
-                self.threats = self.threats or pawnAttacks(nonSideToMove, square)
-            of Rook:
-                self.threats = self.threats or rookMoves(square, occupancy)
-            of Bishop:
-                self.threats = self.threats or bishopMoves(square, occupancy)
-            of Knight:
-                self.threats = self.threats or knightMoves(square)
-            of King:
-                self.threats = self.threats or kingMoves(square)
-            of Queen:
-                self.threats = self.threats or (bishopMoves(square, occupancy) or rookMoves(square, occupancy))
-            else:
-                discard
+proc computeThreats(self: Position): Bitboard =
+    let
+        nonSideToMove = self.sideToMove.opposite()
+        occupancy = self.pieces()
+        enemyPawns = self.pieces(Pawn, nonSideToMove)
+
+    # Pawn attacks can be generated for the whole set at once. Iterating them
+    # individually adds mailbox lookups and a case dispatch for the most common
+    # enemy piece without changing the resulting attack map.
+    result = enemyPawns.forwardLeft(nonSideToMove) or enemyPawns.forwardRight(nonSideToMove)
+    let enemyQueens = self.pieces(Queen, nonSideToMove)
+    for square in self.pieces(Rook, nonSideToMove) or enemyQueens:
+        result = result or rookMoves(square, occupancy)
+    for square in self.pieces(Bishop, nonSideToMove) or enemyQueens:
+        result = result or bishopMoves(square, occupancy)
+    for square in self.pieces(Knight, nonSideToMove):
+        result = result or knightMoves(square)
+    result = result or kingMoves(self.kingSquare(nonSideToMove))
+
+
+proc threats*(self: var Position): Bitboard {.inline.} =
+    ## Returns all squares attacked by the non-side-to-move, computing and
+    ## caching them on first use for this position.
+    if self.threatsCache.isEmpty():
+        self.threatsCache = self.computeThreats()
+    return self.threatsCache
 
 
 proc hash*(self: var Position) =
@@ -552,7 +588,7 @@ proc fromFEN*(fen: string): Position =
         piece: Piece
 
     # Make sure the mailbox is actually empty
-    for sq in Square.all():
+    for sq in Square.items():
         result.mailbox[sq] = nullPiece()
 
     # See https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation
@@ -701,9 +737,9 @@ proc startpos*: Position = fromFEN("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR 
 proc `$`*(self: Position): string =
     result &= "- - - - - - - -"
     var file = File.high()
-    for rank in Rank.all():
+    for rank in Rank.items():
         result &= "\n"
-        for file in File.all():
+        for file in File.items():
             let piece = self.mailbox[makeSquare(rank, file)]
             if piece.kind == Empty:
                 result &= "x "
@@ -718,9 +754,9 @@ proc `$`*(self: Position): string =
 proc toFEN*(self: Position, chess960: bool = false): string =
     var skip: int
     # Piece placement data
-    for rank in Rank.all():
+    for rank in Rank.items():
         skip = 0
-        for file in File.all():
+        for file in File.items():
             let piece = self.on(makeSquare(rank, file))
             if piece.kind == Empty:
                 inc(skip)
@@ -780,10 +816,10 @@ proc pretty*(self: Position): string =
     ## Returns a colored version of the
     ## position for easier visualization
     var file = pcs.File(7)
-    for rank in Rank.all():
+    for rank in Rank.items():
         if rank > 0:
             result &= "\n"
-        for file in File.all():
+        for file in File.items():
             # Equivalent to (rank + file) mod 2
             # (I'm just evil). Could also just
             # use isLightSquare, but again: evil
