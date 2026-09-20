@@ -26,10 +26,43 @@ jobs:
         run: |
           nimble install -y -d
 
-      - name: Patch Android SELinux sysfs restrictions
+      - name: Locate every reference to the blocked sysfs path
         run: |
-          # Prevent unhandled IOError when Android SELinux blocks access to /sys/devices/system/node/online
-          find src/ -type f -name "*.nim" -exec sed -i 's|readFile("/sys/devices/system/node/online")|(if fileExists("/sys/devices/system/node/online"): readFile("/sys/devices/system/node/online") else: "")|g' {} +
+          NIM_BIN=$(which nim)
+          NIM_ROOT=$(dirname "$NIM_BIN")/..
+          echo "Nim root: $NIM_ROOT"
+          echo "----- Searching stdlib -----"
+          grep -rln "node/online" "$NIM_ROOT/lib" 2>/dev/null || echo "none in stdlib"
+          echo "----- Searching nimble package cache -----"
+          grep -rln "node/online" ~/.nimble 2>/dev/null || echo "none in nimble cache"
+          echo "----- Searching project source -----"
+          grep -rln "node/online" . 2>/dev/null || echo "none in project source"
+
+      - name: Patch every occurrence to tolerate a missing/blocked sysfs path
+        run: |
+          NIM_BIN=$(which nim)
+          NIM_ROOT=$(dirname "$NIM_BIN")/..
+
+          patch_occurrences() {
+            local dir="$1"
+            [ -d "$dir" ] || return 0
+            grep -rl "node/online" "$dir" 2>/dev/null | while read -r f; do
+              echo "Patching: $f"
+              sed -i \
+                -e 's|readFile("/sys/devices/system/node/online")|(try: (if fileExists("/sys/devices/system/node/online"): readFile("/sys/devices/system/node/online") else: "") except IOError, OSError: "")|g' \
+                "$f"
+            done
+          }
+
+          patch_occurrences "$NIM_ROOT/lib"
+          patch_occurrences "$HOME/.nimble"
+          patch_occurrences "."
+
+      - name: Verify patch applied
+        run: |
+          NIM_BIN=$(which nim)
+          NIM_ROOT=$(dirname "$NIM_BIN")/..
+          grep -rn "node/online" "$NIM_ROOT/lib" ~/.nimble . 2>/dev/null || echo "No remaining unguarded references"
 
       - name: Build Heimdall (Android ARM64 / NEON)
         run: |
@@ -47,8 +80,22 @@ jobs:
             EXE_BASE=bin/heimdall-android-arm64 \
             EXTRA_NFLAGS="--cpu:arm64 --os:android --clang.exe='$NDK_CLANG' --clang.linkerexe='$NDK_CLANG'"
 
+      - name: List build output
+        run: |
+          find bin -maxdepth 1 -type f -executable
+
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
           name: heimdall-android-arm64
           path: bin/heimdall-android-arm64
+
+      - name: Create prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-build-${{ github.run_number }}
+          name: Heimdall Android Build ${{ github.run_number }}
+          prerelease: true
+          files: bin/heimdall-android-arm64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
