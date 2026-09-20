@@ -153,7 +153,7 @@ when defined(linux):
     proc readTrimmed(path: string): Option[string] =
         try:
             return some(readFile(path).strip())
-        except OSError:
+        except IOError, OSError:
             return none(string)
 
 
