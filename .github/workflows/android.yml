@@ -26,6 +26,11 @@ jobs:
         run: |
           nimble install -y -d
 
+      - name: Patch Android SELinux sysfs restrictions
+        run: |
+          # Prevent unhandled IOError when Android SELinux blocks access to /sys/devices/system/node/online
+          find src/ -type f -name "*.nim" -exec sed -i 's|readFile("/sys/devices/system/node/online")|(if fileExists("/sys/devices/system/node/online"): readFile("/sys/devices/system/node/online") else: "")|g' {} +
+
       - name: Build Heimdall (Android ARM64 / NEON)
         run: |
           NDK_BIN=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
