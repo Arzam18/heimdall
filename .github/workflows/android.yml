@@ -30,11 +30,16 @@ jobs:
         run: |
           NIM_BIN=$(which nim)
           NIM_ROOT=$(dirname "$NIM_BIN")/..
+
+          echo "Nim binary: $NIM_BIN"
           echo "Nim root: $NIM_ROOT"
+
           echo "----- Searching stdlib -----"
           grep -rln "node/online" "$NIM_ROOT/lib" 2>/dev/null || echo "none in stdlib"
+
           echo "----- Searching nimble package cache -----"
           grep -rln "node/online" ~/.nimble 2>/dev/null || echo "none in nimble cache"
+
           echo "----- Searching project source -----"
           grep -rln "node/online" . 2>/dev/null || echo "none in project source"
 
@@ -45,9 +50,12 @@ jobs:
 
           patch_occurrences() {
             local dir="$1"
+
             [ -d "$dir" ] || return 0
+
             grep -rl "node/online" "$dir" 2>/dev/null | while read -r f; do
               echo "Patching: $f"
+
               sed -i \
                 -e 's|readFile("/sys/devices/system/node/online")|(try: (if fileExists("/sys/devices/system/node/online"): readFile("/sys/devices/system/node/online") else: "") except IOError, OSError: "")|g' \
                 "$f"
@@ -62,13 +70,35 @@ jobs:
         run: |
           NIM_BIN=$(which nim)
           NIM_ROOT=$(dirname "$NIM_BIN")/..
-          grep -rn "node/online" "$NIM_ROOT/lib" ~/.nimble . 2>/dev/null || echo "No remaining unguarded references"
+
+          echo "----- Remaining node/online references -----"
+
+          grep -rn \
+            "node/online" \
+            "$NIM_ROOT/lib" \
+            ~/.nimble \
+            . \
+            2>/dev/null || echo "No remaining node/online references"
 
       - name: Build Heimdall (Android ARM64 / NEON)
+        shell: bash
         run: |
-          NDK_BIN=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
-          NDK_CLANG=$NDK_BIN/aarch64-linux-android28-clang
-          NDK_LD=$NDK_BIN/ld.lld
+          set -euxo pipefail
+
+          echo "========================================"
+          echo "Building Heimdall Android ARM64"
+          echo "========================================"
+
+          NDK_BIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          NDK_CLANG="$NDK_BIN/aarch64-linux-android28-clang"
+          NDK_LD="$NDK_BIN/ld.lld"
+
+          echo "NDK_BIN=$NDK_BIN"
+          echo "NDK_CLANG=$NDK_CLANG"
+          echo "NDK_LD=$NDK_LD"
+
+          test -x "$NDK_CLANG"
+          test -x "$NDK_LD"
 
           make neon \
             CC=clang \
@@ -81,8 +111,62 @@ jobs:
             EXTRA_NFLAGS="--cpu:arm64 --os:android --clang.exe='$NDK_CLANG' --clang.linkerexe='$NDK_CLANG'"
 
       - name: List build output
+        shell: bash
         run: |
-          find bin -maxdepth 1 -type f -executable
+          set -euxo pipefail
+
+          echo "========================================"
+          echo "Build output"
+          echo "========================================"
+
+          find bin -maxdepth 1 -type f -executable -print
+
+          test -f bin/heimdall-android-arm64
+          test -x bin/heimdall-android-arm64
+
+          ls -lh bin/heimdall-android-arm64
+
+          file bin/heimdall-android-arm64
+
+      - name: Inspect compiled binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "========================================"
+          echo "Inspecting compiled Heimdall binary"
+          echo "========================================"
+
+          BINARY="bin/heimdall-android-arm64"
+
+          test -f "$BINARY"
+
+          echo
+          echo "----- Binary information -----"
+          file "$BINARY"
+
+          echo
+          echo "----- Searching binary for sysfs path -----"
+
+          strings "$BINARY" | grep -E \
+            'node/online|devices/system/node' \
+            || echo "No matching sysfs path found in binary."
+
+          echo
+          echo "----- Searching binary for NUMA references -----"
+
+          strings "$BINARY" | grep -Ei \
+            'numa|node' \
+            | head -100 \
+            || echo "No obvious NUMA references found."
+
+          echo
+          echo "----- Searching binary for Nim syncio references -----"
+
+          strings "$BINARY" | grep -Ei \
+            'syncio\.nim|readFile' \
+            | head -100 \
+            || echo "No obvious syncio/readFile references found."
 
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
