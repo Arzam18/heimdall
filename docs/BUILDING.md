@@ -2,11 +2,25 @@
 
 The latest stable release is the easiest way to install Heimdall. See the
 [download table in the README](../README.md#how-to-pick-the-right-executable)
-for the universal archive that matches your system.
+for the universal download that matches your system.
+
+Each release offers executables directly as well as `.tar.gz` archives
+(Linux/macOS) or `.zip` archives (Windows). Extract an archive, or download the
+executable itself. On Linux and macOS, direct downloads may need execute
+permission:
+
+```sh
+chmod +x /path/to/downloaded/heimdall-executable
+```
+
+Use the actual downloaded filename, then run it or select it in your chess GUI.
+On Windows, the direct download is the `.exe` file and needs no `chmod` step.
+See [Linux release requirements](RELEASES.md#linux-universal-executable) for the
+combined executable's runtime cache and standalone fallbacks.
 
 ## Requirements
 
-- Nim 2.2.6, pinned in `heimdall.nimble`
+- Nim 2.2.2 or greater, as required by `heimdall.nimble`
 - Clang and the platform linker (LLD on Linux/Windows, Apple `ld` on macOS)
 - Git LFS when fetching network weights
 
@@ -32,11 +46,20 @@ backend selection. Run `bin/heimdall simd` to see the selected backend, or set
 `make macos-universal SKIP_DEPS=1 EVALFILE=/absolute/path/to/net.bin` combines
 Intel and Apple Silicon slices.
 
+On Linux, `SIMD=universal` builds for the selected CPU family. The combined
+`linux-universal` release is a self-extracting executable containing both native
+builds and one shared network. It requires `/bin/sh`, GNU coreutils, `gzip`, and
+a writable private cache on a filesystem that permits execution. See
+[the Linux packaging instructions](RELEASES.md#linux-universal-executable) for
+cache settings and local assembly. Internal slices use `EMBED_NET=0` and load
+`network.bin` beside the executable; ordinary builds keep `EMBED_NET=1`.
+
 Portable targets use generic CPU tuning. For example, `make avx2 TUNE=znver2`
 uses `-march=x86-64-v3 -mtune=znver2` while retaining the AVX2 requirement.
 The old `legacy`, `modern`, `zen2`, and `vnni` target names are gone. Intel and
 Apple Silicon Macs can use `make macos-amd64` and `make macos-arm64`
-respectively. The resulting executable is in `bin/$(EXE)`.
+respectively. The default output is `bin/heimdall` (`.exe` on Windows);
+set `EXE_BASE` to choose another output path.
 
 See [SIMD.md](SIMD.md) for backend targets, scalar builds, universal dispatch,
 cross-compilation, and architecture-specific constraints. See
