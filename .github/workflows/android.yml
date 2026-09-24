@@ -1,4 +1,4 @@
-name: Build Heimdall for Android (ARM64)
+Name: Build Heimdall for Android (ARM64)
 
 on:
   push:
@@ -79,6 +79,18 @@ jobs:
             ~/.nimble \
             . \
             2>/dev/null || echo "No remaining node/online references"
+
+      - name: Patch EnableWeirdTCs default to true
+        run: |
+          echo "========================================"
+          echo "Patching EnableWeirdTCs default in Nim source"
+          echo "========================================"
+
+          # Update the UCI default declaration string
+          find src/ -type f -name "*.nim" -exec sed -i 's/option name EnableWeirdTCs type check default false/option name EnableWeirdTCs type check default true/g' {} +
+
+          # Update the session initialization object
+          find src/ -type f -name "*.nim" -exec sed -i 's/isMixedMode: true)/isMixedMode: true, enableWeirdTCs: true)/g' {} +
 
       - name: Build Heimdall (Android ARM64 / NEON)
         shell: bash
