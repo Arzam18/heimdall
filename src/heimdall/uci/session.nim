@@ -218,7 +218,7 @@ proc startUCISession* =
                     echo "option name UCI_Chess960 type check default false"
                     echo "option name EvalFile type string default <default>"
                     echo "option name NormalizeScore type check default true"
-                    echo "option name EnableWeirdTCs type check default false"
+                    echo "option name EnableWeirdTCs type check default true"
                     echo "option name MultiPV type spin default 1 min 1 max 218"
                     echo "option name Threads type spin default 1 min 1 max 1024"
                     echo "option name RandomizeSoftLimit type check default false"
