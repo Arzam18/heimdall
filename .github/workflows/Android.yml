@@ -1,0 +1,197 @@
+name: Build Heimdall for Android (ARM64)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-android-arm64:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - name: Setup Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: 'stable'
+
+      - name: Install Nimble Dependencies
+        run: |
+          nimble install -y -d
+
+      - name: Locate every reference to the blocked sysfs path
+        run: |
+          NIM_BIN=$(which nim)
+          NIM_ROOT=$(dirname "$NIM_BIN")/..
+
+          echo "Nim binary: $NIM_BIN"
+          echo "Nim root: $NIM_ROOT"
+
+          echo "----- Searching stdlib -----"
+          grep -rln "node/online" "$NIM_ROOT/lib" 2>/dev/null || echo "none in stdlib"
+
+          echo "----- Searching nimble package cache -----"
+          grep -rln "node/online" ~/.nimble 2>/dev/null || echo "none in nimble cache"
+
+          echo "----- Searching project source -----"
+          grep -rln "node/online" . 2>/dev/null || echo "none in project source"
+
+      - name: Patch every occurrence to tolerate a missing/blocked sysfs path
+        run: |
+          NIM_BIN=$(which nim)
+          NIM_ROOT=$(dirname "$NIM_BIN")/..
+
+          patch_occurrences() {
+            local dir="$1"
+
+            [ -d "$dir" ] || return 0
+
+            grep -rl "node/online" "$dir" 2>/dev/null | while read -r f; do
+              echo "Patching: $f"
+
+              sed -i \
+                -e 's|readFile("/sys/devices/system/node/online")|(try: (if fileExists("/sys/devices/system/node/online"): readFile("/sys/devices/system/node/online") else: "") except IOError, OSError: "")|g' \
+                "$f"
+            done
+          }
+
+          patch_occurrences "$NIM_ROOT/lib"
+          patch_occurrences "$HOME/.nimble"
+          patch_occurrences "."
+
+      - name: Verify patch applied
+        run: |
+          NIM_BIN=$(which nim)
+          NIM_ROOT=$(dirname "$NIM_BIN")/..
+
+          echo "----- Remaining node/online references -----"
+
+          grep -rn \
+            "node/online" \
+            "$NIM_ROOT/lib" \
+            ~/.nimble \
+            . \
+            2>/dev/null || echo "No remaining node/online references"
+
+      - name: Patch EnableWeirdTCs default to true
+        run: |
+          echo "========================================"
+          echo "Patching EnableWeirdTCs default in Nim source"
+          echo "========================================"
+
+          # Update the UCI default declaration string
+          find src/ -type f -name "*.nim" -exec sed -i 's/option name EnableWeirdTCs type check default false/option name EnableWeirdTCs type check default true/g' {} +
+
+          # Update the session initialization object
+          find src/ -type f -name "*.nim" -exec sed -i 's/isMixedMode: true)/isMixedMode: true, enableWeirdTCs: true)/g' {} +
+
+      - name: Build Heimdall (Android ARM64 / NEON)
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "========================================"
+          echo "Building Heimdall Android ARM64"
+          echo "========================================"
+
+          NDK_BIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          NDK_CLANG="$NDK_BIN/aarch64-linux-android28-clang"
+          NDK_LD="$NDK_BIN/ld.lld"
+
+          echo "NDK_BIN=$NDK_BIN"
+          echo "NDK_CLANG=$NDK_CLANG"
+          echo "NDK_LD=$NDK_LD"
+
+          test -x "$NDK_CLANG"
+          test -x "$NDK_LD"
+
+          make neon \
+            CC=clang \
+            LD="$NDK_LD" \
+            HOST_ARCH=arm64 \
+            NATIVE_ARCH_FLAGS="" \
+            CFLAGS="-flto" \
+            OS_TAG=android \
+            EXE_BASE=bin/heimdall-android-arm64 \
+            EXTRA_NFLAGS="--cpu:arm64 --os:android --clang.exe='$NDK_CLANG' --clang.linkerexe='$NDK_CLANG'"
+
+      - name: List build output
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "========================================"
+          echo "Build output"
+          echo "========================================"
+
+          find bin -maxdepth 1 -type f -executable -print
+
+          test -f bin/heimdall-android-arm64
+          test -x bin/heimdall-android-arm64
+
+          ls -lh bin/heimdall-android-arm64
+
+          file bin/heimdall-android-arm64
+
+      - name: Inspect compiled binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "========================================"
+          echo "Inspecting compiled Heimdall binary"
+          echo "========================================"
+
+          BINARY="bin/heimdall-android-arm64"
+
+          test -f "$BINARY"
+
+          echo
+          echo "----- Binary information -----"
+          file "$BINARY"
+
+          echo
+          echo "----- Searching binary for sysfs path -----"
+
+          strings "$BINARY" | grep -E \
+            'node/online|devices/system/node' \
+            || echo "No matching sysfs path found in binary."
+
+          echo
+          echo "----- Searching binary for NUMA references -----"
+
+          strings "$BINARY" | grep -Ei \
+            'numa|node' \
+            | head -100 \
+            || echo "No obvious NUMA references found."
+
+          echo
+          echo "----- Searching binary for Nim syncio references -----"
+
+          strings "$BINARY" | grep -Ei \
+            'syncio\.nim|readFile' \
+            | head -100 \
+            || echo "No obvious syncio/readFile references found."
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: heimdall-android-arm64
+          path: bin/heimdall-android-arm64
+
+      - name: Create prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-build-${{ github.run_number }}
+          name: Heimdall Android Build ${{ github.run_number }}
+          prerelease: true
+          files: bin/heimdall-android-arm64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
