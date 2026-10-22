@@ -30,6 +30,23 @@ const
     INFO_PANEL_PREFERRED_WIDTH = 30
 
 
+proc resultReason(resultText: string): string =
+    let openParen = resultText.find('(')
+    if openParen < 0 or not resultText.endsWith(")"):
+        return ""
+    resultText[openParen + 1..^2].strip()
+
+
+proc fitLine(value: string, width: int): string =
+    if width <= 0:
+        return ""
+    if value.len <= width:
+        return value
+    if width <= 3:
+        return value[0..<width]
+    value[0..<width - 3] & "..."
+
+
 proc annotatedReplaySan(state: AppState, index: int, san: string): string =
     if state.mode != ModeReplay or not state.hasGameAnalysis():
         return san
@@ -84,6 +101,32 @@ proc formatNodes(n: uint64): string =
 
 proc formatSpeed(n: uint64): string =
     formatNodes(n) & " nodes/sec"
+
+
+proc watchEngineLabel(state: AppState): string =
+    let side = state.board.sideToMove()
+    let name =
+        if side == White and state.play.watchWhiteExternal.name.len > 0:
+            state.play.watchWhiteExternal.name
+        elif side == Black and state.play.watchBlackExternal.name.len > 0:
+            state.play.watchBlackExternal.name
+        else:
+            "Heimdall"
+    &"{side} engine: {name}"
+
+
+proc playSideName(state: AppState, side: PieceColor): string =
+    if state.play.watchMode:
+        if side == White and state.play.watchWhiteExternal.name.len > 0:
+            return state.play.watchWhiteExternal.name
+        if side == Black and state.play.watchBlackExternal.name.len > 0:
+            return state.play.watchBlackExternal.name
+        return "Heimdall"
+
+    if side == state.play.playerColor:
+        "You"
+    else:
+        "Heimdall"
 
 
 proc formatCastling(board: Chessboard, chess960: bool): string =
@@ -239,7 +282,13 @@ proc drawInfoPanel(tb: var TerminalBuffer, state: AppState, startX, startY, widt
                 tb.write(startX, y, "[YOUR TURN]")
             of GameOver:
                 tb.setForegroundColor(fgRed, bright=true)
-                tb.write(startX, y, "[GAME OVER]")
+                let reason =
+                    if state.play.result.isSome():
+                        resultReason(state.play.result.get())
+                    else:
+                        ""
+                let label = if reason.len > 0: "[GAME OVER: " & reason & "]" else: "[GAME OVER]"
+                tb.write(startX, y, fitLine(label, width))
             of Setup:
                 tb.setForegroundColor(fgCyan, bright=true)
                 tb.write(startX, y, "[SETUP]")
@@ -351,13 +400,22 @@ proc drawInfoPanel(tb: var TerminalBuffer, state: AppState, startX, startY, widt
             flushMoveLine()
     # Replay panes follow immediately after the move list to keep them away from the graph.
 
-    # Analysis depth/nodes/nps (hidden during play mode)
+    # Analysis depth/nodes/nps. Normal play hides this; watch mode uses it to
+    # show the currently thinking engine's principal variation.
     let hasCurrentAnalysis = state.analysis.linesPositionKey == state.board.zobristKey().uint64 and state.analysis.lines.len > 0
-    if state.mode != ModePlay and (state.analysis.running or hasCurrentAnalysis):
-        let speedDisplay = if state.analysis.running: formatSpeed(state.analysis.nps) else: "N/A"
-        infoLine("Depth:", $state.analysis.depth)
-        infoLine("Nodes:", formatNodes(state.analysis.nodes))
-        infoLine("Speed:", speedDisplay)
+    let showWatchAnalysis = state.mode == ModePlay and state.play.watchMode and state.play.phase != Setup
+    if showWatchAnalysis or (state.mode != ModePlay and (state.analysis.running or hasCurrentAnalysis)):
+        let waitingForWatchInfo = showWatchAnalysis and not hasCurrentAnalysis
+        let speedDisplay =
+            if waitingForWatchInfo:
+                "..."
+            elif state.analysis.running or (showWatchAnalysis and state.play.engineThinking):
+                formatSpeed(state.analysis.nps)
+            else:
+                "N/A"
+        infoLine("Depth:", if waitingForWatchInfo: "..." else: $state.analysis.depth)
+        infoLine("Nodes:", if waitingForWatchInfo: "..." else: formatNodes(state.analysis.nodes))
+        infoLine("Speed:", if showWatchAnalysis: fitLine(speedDisplay, width - labelCol - 1) else: speedDisplay)
 
         # WDL for the primary line
         if hasCurrentAnalysis and state.analysis.lines[0].pv.len > 0:
@@ -380,17 +438,26 @@ proc drawInfoPanel(tb: var TerminalBuffer, state: AppState, startX, startY, widt
             tb.setForegroundColor(fgRed, bright=true)
             tb.write(x, y, lossLabel)
             inc y
+        elif showWatchAnalysis:
+            infoLine("WDL:", "...")
 
         inc y
 
         # Analysis lines (MultiPV)
-        if hasCurrentAnalysis:
+        if hasCurrentAnalysis or showWatchAnalysis:
             tb.setForegroundColor(fgCyan, bright=true)
-            tb.write(startX, y, "Analysis Lines:")
+            let title = if showWatchAnalysis: state.watchEngineLabel() else: "Analysis Lines:"
+            tb.write(startX, y, title)
             inc y
 
+            let pvStartY = y
+            if waitingForWatchInfo:
+                tb.setForegroundColor(fgWhite)
+                tb.write(startX, y, fitLine("Waiting for engine info...", width))
+
             let mat = state.board.material()
-            for i, line in state.analysis.lines:
+            let lines = if hasCurrentAnalysis: state.analysis.lines else: @[]
+            for i, line in lines:
                 if y >= startY + height - 4:
                     break
                 if line.pv.len == 0:
@@ -436,6 +503,10 @@ proc drawInfoPanel(tb: var TerminalBuffer, state: AppState, startX, startY, widt
                 tb.setForegroundColor(fgWhite)
                 tb.write(x, y, pvStr)
                 inc y
+
+            if showWatchAnalysis:
+                let reservedRows = min(max(1, state.play.watchPVRows), max(0, startY + height - 4 - pvStartY))
+                y = max(y, pvStartY + reservedRows)
 
 
     if state.mode == ModeReplay and y < panelBottom:
@@ -615,8 +686,8 @@ proc drawInfoPanel(tb: var TerminalBuffer, state: AppState, startX, startY, widt
         tb.write(startX, y, "Clocks:")
         inc y
 
-        let whiteLabel = if state.play.watchMode: "Engine" elif state.play.playerColor == White: "You" else: "Engine"
-        let blackLabel = if state.play.watchMode: "Engine" elif state.play.playerColor == Black: "You" else: "Engine"
+        let whiteLabel = state.playSideName(White)
+        let blackLabel = state.playSideName(Black)
 
         let whiteLimit =
             if state.play.watchMode:
@@ -636,14 +707,17 @@ proc drawInfoPanel(tb: var TerminalBuffer, state: AppState, startX, startY, widt
         let wClock = if state.play.playerColor == White: state.play.playerClock else: state.play.engineClock
         let bClock = if state.play.playerColor == Black: state.play.playerClock else: state.play.engineClock
 
-        let clockCol = 15
+        let whiteClockLabel = &"W ({whiteLabel}):"
+        let blackClockLabel = &"B ({blackLabel}):"
+        let desiredClockCol = max(15, max(whiteClockLabel.len, blackClockLabel.len) + 1)
+        let clockCol = min(desiredClockCol, max(8, width - 10))
         tb.setForegroundColor(fgCyan)
-        tb.write(startX, y, &"W ({whiteLabel}):")
+        tb.write(startX, y, fitLine(whiteClockLabel, max(1, clockCol - 1)))
         tb.setForegroundColor(fgWhite, bright=true)
         tb.write(startX + clockCol, y, formatClockForGame(whiteLimit, wClock))
         inc y
         tb.setForegroundColor(fgCyan)
-        tb.write(startX, y, &"B ({blackLabel}):")
+        tb.write(startX, y, fitLine(blackClockLabel, max(1, clockCol - 1)))
         tb.setForegroundColor(fgWhite, bright=true)
         tb.write(startX + clockCol, y, formatClockForGame(blackLimit, bClock))
         inc y
@@ -651,7 +725,7 @@ proc drawInfoPanel(tb: var TerminalBuffer, state: AppState, startX, startY, widt
 
 
 proc drawEvalBarLabel(tb: var TerminalBuffer, state: AppState, boardX, boardY, boardHeight: int) =
-    if state.mode == ModePlay:
+    if state.mode == ModePlay and not state.play.watchMode:
         return
 
     let gutterWidth = boardX - BOARD_MARGIN_X

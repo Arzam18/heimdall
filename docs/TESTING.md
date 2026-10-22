@@ -33,6 +33,27 @@ make dev MAIN=tests/test_tui_notation.nim IS_TEST=1 \
 bin/test-tui-notation
 ```
 
+The external-engine watch test uses a subprocess UCI peer to check protocol
+commands, options, standard/Chess960 castling, pondering, mixed-engine games,
+PGN metadata, repeated games and startup/search failures. Set `TUI_UCI_ENGINE`
+to additionally exercise an installed engine:
+
+```sh
+make dev MAIN=tests/test_tui_uci.nim IS_TEST=1 \
+  EXE_BASE=bin/test-tui-uci EVALFILE="$PWD/networks/files/tyrfing.bin"
+bin/test-tui-uci
+TUI_UCI_ENGINE=stockfish bin/test-tui-uci
+```
+
+The terminal-buffer rendering test checks stable watch-panel rows between turns,
+including narrow panels and MultiPV, and the watch eval score label:
+
+```sh
+make dev MAIN=tests/test_tui_render.nim IS_TEST=1 \
+  EXE_BASE=bin/test-tui-render EVALFILE="$PWD/networks/files/tyrfing.bin"
+bin/test-tui-render
+```
+
 ## Focused NNUE checks
 
 The local `threans.bin` fixture is for the single-layer debug architecture.
