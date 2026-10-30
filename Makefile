@@ -60,7 +60,7 @@ SINGLE_LAYER ?= 0
 ifeq ($(SINGLE_LAYER),1)
 	EVALFILE := $(CURDIR)/threans.bin
 else
-	EVALFILE := ../networks/files/tyrfing-12ksn.bin
+	EVALFILE := ../networks/files/remiel.bin
 ifeq ($(strip $(EVALFILE)),)
 	$(error Set EVALFILE to a multilayer TI network when SINGLE_LAYER=0)
 endif
@@ -160,7 +160,7 @@ IS_TEST := 0
 DBG_SYMBOLS := 0
 MAJOR_VERSION := 1
 MINOR_VERSION := 5
-PATCH_VERSION := 1
+PATCH_VERSION := 2
 THP_PAGE_ALIGNMENT := 2097152
 
 ifeq ($(IS_RELEASE),1)

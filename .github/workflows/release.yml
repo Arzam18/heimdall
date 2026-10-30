@@ -101,7 +101,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang-18 llvm-18 libclang-rt-18-dev lld-18 curl gcc git-lfs make xz-utils zlib1g-dev
-          echo "MAKEFLAGS=CC=clang-18 LD=lld-18 LLVM_PROFDATA=llvm-profdata-18" >> "$GITHUB_ENV"
+          # Nim expects the compiler family "clang"; PATH selects its version.
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+          echo "MAKEFLAGS=CC=clang LD=lld LLVM_PROFDATA=llvm-profdata" >> "$GITHUB_ENV"
       - name: Install Android NDK and build dependencies
         if: matrix.os == 'android'
         run: |
@@ -188,6 +190,13 @@ jobs:
           HEIMDALL_REMOTE=1 HEIMDALL="$PWD/build/android/release-runner" \
             python3 -m unittest discover -s ../ci/tests -p test_uci.py
           HEIMDALL_ANDROID=/data/local/tmp/heimdall python3 -m unittest discover -s ../ci/tests -p test_android.py
+      - name: Show Android emulator diagnostics on failure
+        if: failure() && matrix.target == 'android-amd64-universal'
+        run: |
+          adb devices -l || true
+          if [[ -f build/android/release-emulator.log ]]; then
+            tail -n 200 build/android/release-emulator.log
+          fi
       - name: Build and check Linux slice with shared weights
         if: needs.plan.outputs.linux_universal == 'true' && (matrix.target == 'linux-amd64-universal' || matrix.target == 'linux-arm64-universal')
         run: |
